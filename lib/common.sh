@@ -157,11 +157,13 @@ print_summary() {
 # if SERVICE_STOPPED=1 (i.e. we're past the point of no return), then exits.
 die() {
   local code="$1" msg="$2" hint="${3:-}"
-  log_error "$msg"
-  [[ -n "$hint" ]] && printf '%s-> %s%s\n' "$C_YELLOW" "$hint" "$C_RESET"
-  if [[ "${SERVICE_STOPPED:-0}" -eq 1 ]]; then
-    tail_xui_log 20
-  fi
+  {
+    log_error "$msg"
+    [[ -n "$hint" ]] && printf '%s-> %s%s\n' "$C_YELLOW" "$hint" "$C_RESET"
+    if [[ "${SERVICE_STOPPED:-0}" -eq 1 ]]; then
+      tail_xui_log 20
+    fi
+  } >&2
   exit "$code"
 }
 

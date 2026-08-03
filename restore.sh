@@ -125,11 +125,13 @@ print_summary() {
 
 die() {
   local code="$1" msg="$2" hint="${3:-}"
-  log_error "$msg"
-  [[ -n "$hint" ]] && printf '%s-> %s%s\n' "$C_YELLOW" "$hint" "$C_RESET"
-  if [[ "${SERVICE_STOPPED:-0}" -eq 1 ]]; then
-    tail_xui_log 20
-  fi
+  {
+    log_error "$msg"
+    [[ -n "$hint" ]] && printf '%s-> %s%s\n' "$C_YELLOW" "$hint" "$C_RESET"
+    if [[ "${SERVICE_STOPPED:-0}" -eq 1 ]]; then
+      tail_xui_log 20
+    fi
+  } >&2
   exit "$code"
 }
 
@@ -390,7 +392,7 @@ run_step() {
 # END shared helpers
 # ============================================================================
 
-trap 'die "$EXIT_GENERIC" "Unexpected error on line $LINENO (command: $BASH_COMMAND)"' ERR
+trap 'rc=$?; [[ $rc -ge 2 ]] && exit "$rc"; die "$EXIT_GENERIC" "Unexpected error on line $LINENO (command: $BASH_COMMAND)"' ERR
 
 # ---- restore.sh-specific state --------------------------------------------
 ARCHIVE_PATH=""
