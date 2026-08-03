@@ -1,0 +1,688 @@
+#!/usr/bin/env bash
+# lib/common.sh — REFERENCE / DEVELOPMENT COPY ONLY.
+#
+# backup.sh and restore.sh do NOT source this file at runtime. Both must stay
+# runnable via `bash <(curl -fsSL https://raw.githubusercontent.com/alionthecode/xui-mover/main/backup.sh)`
+# with no other files present, so the functions below are inlined verbatim
+# into both entry-point scripts between the "BEGIN/END shared helpers"
+# markers. If you change a function here, copy the change into both
+# entry-point scripts by hand and note it in CHANGELOG.md.
+#
+# Design note: pg_dump/pg_restore always run as root, over TCP, using the
+# credentials parsed out of XUI_DB_DSN (via PGPASSWORD) — never via
+# `sudo -u postgres`. x-ui provisions its Postgres role for password/TCP
+# auth, not OS-peer auth, so connecting this way sidesteps the classic
+# "the postgres system user can't traverse into /root (mode 700)" failure
+# by construction, rather than working around it with directory permissions.
+#
+# This file is not meant to be executed directly.
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Places x-ui's systemd unit may load its EnvironmentFile from, depending on
+# distro. This tool only supports Debian/Ubuntu (first entry) per the PRD's
+# non-goals, but resolve_xui_env_file() checks the others too as a defensive
+# fallback before giving up.
+readonly XUI_ENV_FILE_CANDIDATES=(/etc/default/x-ui /etc/conf.d/x-ui /etc/sysconfig/x-ui)
+readonly XUI_SERVICE="x-ui"
+readonly XUI_MAIN_FOLDER_DEFAULT="/usr/local/x-ui"
+readonly XUI_SQLITE_FOLDER_DEFAULT="/etc/x-ui"
+readonly XUI_SQLITE_FILENAME="x-ui.db"
+readonly XUI_CERT_DIR="/root/cert"
+# Working directory AND final archive both live under /root (not /tmp):
+# everything here runs as root and /tmp is world-readable by default, so
+# keeping credential-bearing files under /root reduces exposure.
+readonly WORK_ROOT="/root/xui-mover"
+readonly REMOTE_INCOMING_DIR_DEFAULT="/root/xui-mover-incoming"
+readonly SERVICE_TIMEOUT_SECS=30
+readonly TOOL_VERSION="1.0.0"
+
+# ============================================================================
+# Exit codes — one distinct code per failure class (never a bare exit 1
+# except the true catch-all), so scripted/support use can branch on $?.
+# ============================================================================
+
+readonly EXIT_GENERIC=1                     # unexpected/unhandled error (ERR trap catch-all)
+readonly EXIT_NOT_ROOT=2                    # not running as root
+readonly EXIT_UNSUPPORTED_OS=3              # non-systemd or non-Debian/Ubuntu host
+readonly EXIT_XUI_NOT_INSTALLED=4           # x-ui service/binary not found
+readonly EXIT_ENV_FILE_MISSING=5            # /etc/default/x-ui (or equivalent) not found
+readonly EXIT_BACKEND_UNKNOWN=6             # unrecognized XUI_DB_TYPE value
+readonly EXIT_DSN_PARSE_FAILED=7            # XUI_DB_DSN missing or doesn't match expected format
+readonly EXIT_DB_FILE_MISSING=8             # SQLite db file not found at resolved path (backup side)
+readonly EXIT_PG_CLIENT_MISSING=9           # pg_dump/pg_restore/psql not installed
+readonly EXIT_SQLITE_CLIENT_MISSING=10      # sqlite3 not installed
+readonly EXIT_MULTI_NODE_BLOCKED=11         # nodes table has rows, no override flag
+readonly EXIT_DUMP_FAILED=12                # pg_dump non-zero, or sqlite snapshot copy failed
+readonly EXIT_ARCHIVE_BUILD_FAILED=13       # tar failed while building the archive
+readonly EXIT_CHECKSUM_MISMATCH=14          # local checksum verification failed
+readonly EXIT_SSH_FAILED=15                 # SSH connectivity test failed (auth or unreachable)
+readonly EXIT_PUSH_VERIFY_FAILED=16         # scp/rsync succeeded but remote file missing/checksum mismatch
+readonly EXIT_ARCHIVE_INVALID=17            # archive missing/corrupt/missing expected members
+readonly EXIT_BACKEND_MISMATCH=18           # archive backend != target's configured backend
+readonly EXIT_PG_TARGET_NOT_PROVISIONED=19  # target's own Postgres role/db unreachable
+readonly EXIT_USER_ABORTED=20               # typed confirmation didn't match, or user declined a prompt
+readonly EXIT_SERVICE_STOP_FAILED=21        # systemctl stop x-ui didn't reach inactive within timeout
+readonly EXIT_RESTORE_FAILED=22             # pg_restore reported errors, or sqlite replace/integrity-check failed
+readonly EXIT_SANITY_CHECK_FAILED=23        # post-restore count query itself errored
+readonly EXIT_SERVICE_START_FAILED=24       # systemctl start x-ui didn't reach active within timeout
+readonly EXIT_CERT_RESTORE_FAILED=25        # cert copy/permission step failed
+readonly EXIT_BAD_ARGS=26                   # invalid flag combination
+
+# ============================================================================
+# Global state (mutated by functions below; each entry-point's main() must
+# initialize these before parse_flags/preflight runs, since `set -u` is on)
+# ============================================================================
+
+DRY_RUN=0                 # set by --dry-run; run_step() no-ops mutating calls
+NO_COLOR_FLAG=0            # set by --no-color
+ASSUME_YES=0                # set by --yes
+WORKDIR=""                   # set by make_workdir()
+LOG_FILE=""                   # set by setup_logging()
+SERVICE_STOPPED=0              # set to 1 once xui_stop_and_wait() begins; die() tails logs when 1
+PG_USER=""; PG_PASS=""; PG_HOST=""; PG_PORT=""; PG_DB=""; PG_CONN_NOAUTH=""
+SSH_USE_PASSWORD=0; SSH_PASSWORD=""
+
+# ============================================================================
+# Output / logging
+# ============================================================================
+
+# True if stdout is a terminal and color hasn't been disabled.
+ui_supports_color() {
+  [[ -t 1 && "$NO_COLOR_FLAG" -eq 0 && -z "${NO_COLOR:-}" ]]
+}
+
+# Populates C_RED/C_GREEN/C_YELLOW/C_BLUE/C_BOLD/C_RESET, real ANSI codes or
+# empty strings depending on ui_supports_color(). Call once after parse_flags.
+setup_colors() {
+  if ui_supports_color; then
+    C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[0;33m'
+    C_BLUE=$'\033[0;34m'; C_BOLD=$'\033[1m'; C_RESET=$'\033[0m'
+  else
+    C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_BOLD=""; C_RESET=""
+  fi
+}
+
+# Tees all subsequent stdout/stderr to both the terminal (with color) and a
+# log file (ANSI stripped, so it's shareable as plain text for support).
+# Falls back to $WORK_ROOT if /var/log isn't writable.
+setup_logging() {
+  local ts
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  LOG_FILE="/var/log/xui-mover-${ts}.log"
+  if ! ( : >>"$LOG_FILE" ) 2>/dev/null; then
+    mkdir -p "$WORK_ROOT" 2>/dev/null || true
+    LOG_FILE="$WORK_ROOT/xui-mover-${ts}.log"
+  fi
+  exec > >(tee >(sed -u -r 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE")) 2>&1
+  log_info "Logging to $LOG_FILE"
+}
+
+log_info()    { printf '%s[INFO]%s %s\n' "$C_BLUE" "$C_RESET" "$1"; }
+log_warn()    { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$1"; }
+log_error()   { printf '%s[ERROR]%s %s\n' "$C_RED" "$C_RESET" "$1"; }
+log_success() { printf '%s[ OK ]%s %s\n' "$C_GREEN" "$C_RESET" "$1"; }
+
+# step_banner CUR TOTAL DESCRIPTION — the numbered phase header printed once
+# per phase, e.g. "[3/8] Dumping database...".
+step_banner() {
+  printf '\n%s%s[%s/%s] %s%s\n' "$C_BLUE" "$C_BOLD" "$1" "$2" "$3" "$C_RESET"
+}
+
+# print_box LINE... — bordered block, visually distinct from step banners.
+# Used for the restore.sh confirmation gate and the multi-node warning so
+# they can't be skimmed past as ordinary log output.
+print_box() {
+  local line max=0
+  for line in "$@"; do (( ${#line} > max )) && max=${#line}; done
+  local border; border=$(printf -- '-%.0s' $(seq 1 $((max + 2))))
+  printf '%s+%s+%s\n' "$C_BOLD" "$border" "$C_RESET"
+  for line in "$@"; do
+    printf '%s|%s %-*s %s|%s\n' "$C_BOLD" "$C_RESET" "$max" "$line" "$C_BOLD" "$C_RESET"
+  done
+  printf '%s+%s+%s\n' "$C_BOLD" "$border" "$C_RESET"
+}
+
+# print_summary TITLE LINE... — final one-screen summary block.
+print_summary() {
+  local title="$1"; shift
+  printf '\n'
+  print_box "$title" "" "$@"
+}
+
+# die EXIT_CODE MESSAGE [HINT] — the single chokepoint for every non-zero
+# exit. Logs the error, an optional actionable hint, auto-tails the x-ui log
+# if SERVICE_STOPPED=1 (i.e. we're past the point of no return), then exits.
+die() {
+  local code="$1" msg="$2" hint="${3:-}"
+  log_error "$msg"
+  [[ -n "$hint" ]] && printf '%s-> %s%s\n' "$C_YELLOW" "$hint" "$C_RESET"
+  if [[ "${SERVICE_STOPPED:-0}" -eq 1 ]]; then
+    tail_xui_log 20
+  fi
+  exit "$code"
+}
+
+# confirm_yes_no PROMPT [DEFAULT=n] — informational, non-safety-critical
+# prompt. Honors ASSUME_YES. Never used for the restore.sh destructive gate.
+confirm_yes_no() {
+  local prompt="$1" default="${2:-n}" reply suffix="[y/N]"
+  [[ "$default" == "y" ]] && suffix="[Y/n]"
+  [[ "$ASSUME_YES" -eq 1 ]] && return 0
+  read -r -p "$prompt $suffix " reply || reply=""
+  reply="${reply,,}"
+  if [[ -z "$reply" ]]; then
+    [[ "$default" == "y" ]]
+    return
+  fi
+  [[ "$reply" == "y" || "$reply" == "yes" ]]
+}
+
+# confirm_typed EXPECTED — byte-exact match against typed input. Never
+# accepts y/yes as equivalent. This is restore.sh's safety-critical gate.
+confirm_typed() {
+  local expected="$1" reply
+  read -r -p "Type '${expected}' to proceed: " reply || reply=""
+  [[ "$reply" == "$expected" ]]
+}
+
+# ============================================================================
+# Cleanup / traps
+# ============================================================================
+
+# Creates $WORK_ROOT/run-<ts>-$$ (mode 700) and sets WORKDIR to it.
+make_workdir() {
+  mkdir -p -m 700 "$WORK_ROOT"
+  WORKDIR="${WORK_ROOT}/run-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  mkdir -p -m 700 "$WORKDIR"
+}
+
+# Removes WORKDIR on exit (success or failure). Path-guarded so a bad
+# expansion can never rm -rf something unintended. Registered via
+# `trap cleanup EXIT` — does not call exit itself, so the script's real exit
+# status is preserved.
+cleanup() {
+  if [[ -n "${WORKDIR:-}" && "$WORKDIR" == "$WORK_ROOT"/run-* && -d "$WORKDIR" ]]; then
+    # `|| true`: this runs as the EXIT trap under `set -e` — an rm failure
+    # here (busy mount, odd permissions) must never override the script's
+    # real exit code.
+    rm -rf "$WORKDIR" || true
+  fi
+}
+
+# ============================================================================
+# Preflight / detection
+# ============================================================================
+
+require_root() {
+  [[ "$EUID" -eq 0 ]] || die "$EXIT_NOT_ROOT" "This script must be run as root." "Re-run with: sudo bash $0"
+}
+
+require_supported_os() {
+  [[ -r /etc/os-release ]] || die "$EXIT_UNSUPPORTED_OS" "Cannot determine OS (missing /etc/os-release)." "This tool supports Debian/Ubuntu with systemd only."
+  local id="" id_like=""
+  id=$(. /etc/os-release; echo "$ID") || true
+  id_like=$(. /etc/os-release; echo "${ID_LIKE:-}") || true
+  case " $id $id_like " in
+    *" ubuntu "*|*" debian "*) return 0 ;;
+    *) die "$EXIT_UNSUPPORTED_OS" "Unsupported OS: ${id:-unknown}." "This tool supports Debian/Ubuntu with systemd only." ;;
+  esac
+}
+
+require_systemd() {
+  command -v systemctl >/dev/null 2>&1 || die "$EXIT_UNSUPPORTED_OS" "systemd (systemctl) not found." "This tool requires a systemd-based host."
+}
+
+# Finds x-ui's environment file: checks the known candidate paths first,
+# falls back to asking systemd what it actually configured.
+resolve_xui_env_file() {
+  local f
+  for f in "${XUI_ENV_FILE_CANDIDATES[@]}"; do
+    [[ -r "$f" ]] && { printf '%s' "$f"; return 0; }
+  done
+  local shown=""
+  shown=$(systemctl show -p EnvironmentFiles "$XUI_SERVICE" 2>/dev/null | sed -E 's/^EnvironmentFiles=//; s/ \(.*\)$//') || true
+  if [[ -n "$shown" && -r "$shown" ]]; then
+    printf '%s' "$shown"
+    return 0
+  fi
+  die "$EXIT_ENV_FILE_MISSING" "Could not find x-ui's environment file." "Expected /etc/default/x-ui — is x-ui installed?"
+}
+
+# Finds the x-ui binary via systemd's ExecStart, falling back to the
+# documented default install path. Dies if nothing executable is found.
+resolve_xui_bin() {
+  local execstart="" path=""
+  execstart=$(systemctl show -p ExecStart "$XUI_SERVICE" 2>/dev/null) || true
+  path=$(printf '%s' "$execstart" | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2-) || true
+  [[ -z "$path" ]] && path="${XUI_MAIN_FOLDER_DEFAULT}/x-ui"
+  if [[ -x "$path" ]]; then
+    printf '%s' "$path"
+    return 0
+  fi
+  die "$EXIT_XUI_NOT_INSTALLED" "x-ui binary not found or not executable at: $path" "This tool does not install x-ui — install it first, then re-run."
+}
+
+require_xui_installed() {
+  systemctl list-unit-files 2>/dev/null | grep -q "^${XUI_SERVICE}\.service" \
+    || die "$EXIT_XUI_NOT_INSTALLED" "x-ui systemd service not found." "This tool does not install x-ui — install it first, then re-run."
+  resolve_xui_bin >/dev/null
+}
+
+# detect_backend ENV_FILE — reads XUI_DB_TYPE, normalizes to "postgres" or
+# "sqlite". Dies on anything else.
+detect_backend() {
+  local env_file="$1" val=""
+  val=$(grep -E '^XUI_DB_TYPE=' "$env_file" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"' \r') || true
+  case "${val,,}" in
+    ""|sqlite) printf 'sqlite' ;;
+    postgres|postgresql|pg) printf 'postgres' ;;
+    *) die "$EXIT_BACKEND_UNKNOWN" "Unrecognized XUI_DB_TYPE value: '$val' in $env_file" ;;
+  esac
+}
+
+get_xui_version() {
+  local bin="$1" v=""
+  v=$("$bin" -v 2>/dev/null | head -1) || v=""
+  [[ -z "$v" ]] && v="unknown"
+  printf '%s' "$v"
+}
+
+# ============================================================================
+# Postgres
+# ============================================================================
+
+url_decode() {
+  local data="${1//+/ }"
+  printf '%b' "${data//%/\\x}"
+}
+
+# parse_pg_dsn DSN — populates PG_USER/PG_PASS/PG_HOST/PG_PORT/PG_DB and
+# PG_CONN_NOAUTH (a credential-free connection URI reconstructed from the
+# original, preserving arbitrary query params like sslmode instead of
+# assuming one). Dies on an unparseable DSN.
+parse_pg_dsn() {
+  local dsn="$1"
+  if [[ "$dsn" =~ ^postgres(ql)?://([^:@/]+):([^@]*)@([^:/]+):([0-9]+)/([^?]+)(\?(.*))?$ ]]; then
+    PG_USER="${BASH_REMATCH[2]}"
+    PG_PASS="$(url_decode "${BASH_REMATCH[3]}")"
+    PG_HOST="${BASH_REMATCH[4]}"
+    PG_PORT="${BASH_REMATCH[5]}"
+    PG_DB="${BASH_REMATCH[6]}"
+    local query="${BASH_REMATCH[8]}"
+    PG_CONN_NOAUTH="postgres://${PG_HOST}:${PG_PORT}/${PG_DB}${query:+?$query}"
+  else
+    die "$EXIT_DSN_PARSE_FAILED" "Could not parse XUI_DB_DSN." "Expected format: postgres://user:pass@host:port/dbname?sslmode=disable"
+  fi
+}
+
+# mask_dsn DSN — password replaced with **** for safe display/logging.
+mask_dsn() {
+  printf '%s' "$1" | sed -E 's|(://[^:/@]+:)[^@]+@|\1****@|'
+}
+
+pg_client_precheck() {
+  command -v pg_dump >/dev/null 2>&1 && command -v pg_restore >/dev/null 2>&1 \
+    || die "$EXIT_PG_CLIENT_MISSING" "pg_dump/pg_restore not found." "Install with: apt-get install -y postgresql-client, or run: x-ui pgclient <server-major-version>"
+}
+
+# pg_test_connection — returns non-zero (does NOT die) on failure; callers
+# decide the right exit code/hint for their context (e.g. restore.sh's
+# "provision it via x-ui's menu" guidance).
+pg_test_connection() {
+  command -v psql >/dev/null 2>&1 || die "$EXIT_PG_CLIENT_MISSING" "psql not found." "Install with: apt-get install -y postgresql-client"
+  PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc 'SELECT 1;' >/dev/null 2>"$WORKDIR/pg_test.stderr"
+}
+
+pg_dump_to_file() {
+  local out_file="$1"
+  mkdir -p "$(dirname "$out_file")"
+  if ! PGPASSWORD="$PG_PASS" pg_dump -Fc -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -f "$out_file" 2>"$WORKDIR/pg_dump.stderr"; then
+    log_error "pg_dump failed:"
+    tail -n 20 "$WORKDIR/pg_dump.stderr" >&2 2>/dev/null || true
+    die "$EXIT_DUMP_FAILED" "Database dump failed." "Check Postgres connectivity/credentials in the environment file."
+  fi
+}
+
+# pg_restore_from_file DUMP_FILE — restores with --no-owner --role=<user>
+# -c --if-exists so ownership reassignment and pre-existing-object cleanup
+# both happen in one pass. Matches "^pg_restore: error:" specifically
+# (not a bare "ERROR" grep) to avoid false positives on the expected
+# --if-exists NOTICE lines during a first restore.
+pg_restore_from_file() {
+  local dump_file="$1" rc=0
+  PGPASSWORD="$PG_PASS" pg_restore --no-owner --role="$PG_USER" -c --if-exists \
+    -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" "$dump_file" \
+    >"$WORKDIR/pg_restore.out" 2>&1 || rc=$?
+  if grep -qE '^pg_restore: error:' "$WORKDIR/pg_restore.out" 2>/dev/null; then
+    log_error "pg_restore reported errors:"
+    grep -E '^pg_restore: error:' "$WORKDIR/pg_restore.out" | tail -n 20 >&2
+    die "$EXIT_RESTORE_FAILED" "Database restore failed." "See the error lines above."
+  fi
+  if [[ $rc -ne 0 ]]; then
+    tail -n 20 "$WORKDIR/pg_restore.out" >&2
+    die "$EXIT_RESTORE_FAILED" "pg_restore exited with status $rc."
+  fi
+}
+
+# pg_sanity_counts — prints "INBOUNDS_COUNT USERS_COUNT SETTINGS_COUNT". Dies
+# only on a genuine query error, not on a legitimate zero count. The
+# settings-table count exists because that single table holds the panel's
+# global settings *and* the Xray Configuration template (outbounds/routing/
+# DNS, stored as one JSON blob under key "xrayTemplateConfig") — comparing
+# its row count pre/post restore catches "the settings table itself didn't
+# come across" without needing to parse the JSON.
+pg_sanity_counts() {
+  local inbounds="" users="" settings=""
+  inbounds=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc 'SELECT count(*) FROM inbounds;' 2>"$WORKDIR/pg_sanity.stderr") \
+    || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'inbounds' failed." "$(cat "$WORKDIR/pg_sanity.stderr" 2>/dev/null)"
+  users=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc 'SELECT count(*) FROM users;' 2>"$WORKDIR/pg_sanity.stderr") \
+    || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'users' failed." "$(cat "$WORKDIR/pg_sanity.stderr" 2>/dev/null)"
+  settings=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc 'SELECT count(*) FROM settings;' 2>"$WORKDIR/pg_sanity.stderr") \
+    || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'settings' failed." "$(cat "$WORKDIR/pg_sanity.stderr" 2>/dev/null)"
+  printf '%s %s %s' "${inbounds//[[:space:]]/}" "${users//[[:space:]]/}" "${settings//[[:space:]]/}"
+}
+
+# ============================================================================
+# SQLite
+# ============================================================================
+
+sqlite_client_precheck() {
+  command -v sqlite3 >/dev/null 2>&1 || die "$EXIT_SQLITE_CLIENT_MISSING" "sqlite3 not found." "Install with: apt-get install -y sqlite3"
+}
+
+# resolve_sqlite_path ENV_FILE — reads XUI_DB_FOLDER (falls back to the
+# documented default) and joins it with the fixed x-ui.db filename.
+resolve_sqlite_path() {
+  local env_file="$1" folder=""
+  folder=$(grep -E '^XUI_DB_FOLDER=' "$env_file" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"' \r') || true
+  [[ -z "$folder" ]] && folder="$XUI_SQLITE_FOLDER_DEFAULT"
+  printf '%s/%s' "$folder" "$XUI_SQLITE_FILENAME"
+}
+
+sqlite_integrity_check() {
+  local path="$1" result=""
+  result=$(sqlite3 "$path" 'PRAGMA integrity_check;' 2>"$WORKDIR/sqlite_check.stderr") || result=""
+  [[ "$result" == "ok" ]]
+}
+
+sqlite_sanity_counts() {
+  local path="$1" inbounds="" users="" settings=""
+  inbounds=$(sqlite3 "$path" 'SELECT count(*) FROM inbounds;' 2>"$WORKDIR/sqlite_sanity.stderr") \
+    || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'inbounds' failed." "$(cat "$WORKDIR/sqlite_sanity.stderr" 2>/dev/null)"
+  users=$(sqlite3 "$path" 'SELECT count(*) FROM users;' 2>"$WORKDIR/sqlite_sanity.stderr") \
+    || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'users' failed." "$(cat "$WORKDIR/sqlite_sanity.stderr" 2>/dev/null)"
+  settings=$(sqlite3 "$path" 'SELECT count(*) FROM settings;' 2>"$WORKDIR/sqlite_sanity.stderr") \
+    || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'settings' failed." "$(cat "$WORKDIR/sqlite_sanity.stderr" 2>/dev/null)"
+  printf '%s %s %s' "${inbounds//[[:space:]]/}" "${users//[[:space:]]/}" "${settings//[[:space:]]/}"
+}
+
+# ============================================================================
+# Service control
+# ============================================================================
+
+xui_is_active() {
+  systemctl is-active --quiet "$XUI_SERVICE"
+}
+
+# Stops x-ui and polls until inactive (or SERVICE_TIMEOUT_SECS elapses).
+# Sets SERVICE_STOPPED=1 immediately, before even attempting the stop, so
+# that any failure from this point on (including the stop itself failing)
+# triggers die()'s automatic log-tail.
+xui_stop_and_wait() {
+  SERVICE_STOPPED=1
+  if ! systemctl stop "$XUI_SERVICE"; then
+    die "$EXIT_SERVICE_STOP_FAILED" "systemctl stop x-ui failed immediately."
+  fi
+  local waited=0
+  while xui_is_active; do
+    sleep 1
+    waited=$((waited + 1))
+    [[ $waited -ge $SERVICE_TIMEOUT_SECS ]] && die "$EXIT_SERVICE_STOP_FAILED" "x-ui service did not stop within ${SERVICE_TIMEOUT_SECS}s."
+  done
+}
+
+xui_start_and_wait() {
+  if ! systemctl start "$XUI_SERVICE"; then
+    die "$EXIT_SERVICE_START_FAILED" "systemctl start x-ui failed immediately."
+  fi
+  local waited=0
+  until xui_is_active; do
+    sleep 1
+    waited=$((waited + 1))
+    [[ $waited -ge $SERVICE_TIMEOUT_SECS ]] && die "$EXIT_SERVICE_START_FAILED" "x-ui service did not become active within ${SERVICE_TIMEOUT_SECS}s."
+  done
+}
+
+# tail_xui_log [N=20] — journalctl is x-ui's actual log source (no
+# guaranteed static log file); falls back to /var/log/x-ui/*.log if
+# journalctl is unavailable. Called automatically by die() once
+# SERVICE_STOPPED=1, so call sites never need to invoke it themselves.
+tail_xui_log() {
+  local n="${1:-20}"
+  printf '\n%s----- last %s lines of x-ui log -----%s\n' "$C_YELLOW" "$n" "$C_RESET"
+  if command -v journalctl >/dev/null 2>&1; then
+    journalctl -u "$XUI_SERVICE" -n "$n" --no-pager 2>/dev/null || true
+    return 0
+  fi
+  local f=""
+  f=$(ls -t /var/log/x-ui/*.log 2>/dev/null | head -1) || true
+  if [[ -n "$f" ]]; then
+    tail -n "$n" "$f" || true
+  else
+    log_warn "No log source available (journalctl unavailable, no /var/log/x-ui/*.log found)."
+  fi
+}
+
+# ============================================================================
+# Multi-node guard
+# ============================================================================
+
+# count_nodes_rows — relies on the caller having set BACKEND and (for
+# sqlite) SQLITE_PATH globals. Treats a missing 'nodes' table as 0 rather
+# than an error (older/never-multi-node installs may not have the table).
+count_nodes_rows() {
+  local n=""
+  if [[ "$BACKEND" == "postgres" ]]; then
+    n=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc 'SELECT count(*) FROM nodes;' 2>/dev/null) || n="0"
+  else
+    n=$(sqlite3 "$SQLITE_PATH" 'SELECT count(*) FROM nodes;' 2>/dev/null) || n="0"
+  fi
+  n="${n//[[:space:]]/}"
+  [[ -z "$n" ]] && n="0"
+  printf '%s' "$n"
+}
+
+# check_multi_node_guard ALLOW_FLAG(0|1) — warns loudly and dies unless the
+# override flag was given (--i-know-this-is-multi-node), per product
+# decision: backup.sh must not silently produce an incomplete backup.
+check_multi_node_guard() {
+  local allow_flag="$1" n=""
+  n=$(count_nodes_rows)
+  if [[ "$n" -gt 0 ]]; then
+    print_box "MULTI-NODE PANEL DETECTED (${n} node row(s))" \
+      "Only master-node data (inbounds/settings/certs) will be backed up." \
+      "Per-node API tokens/config are NOT included in this backup." \
+      "Multi-node migration is not supported by this tool (v1)."
+    if [[ "$allow_flag" -ne 1 ]]; then
+      die "$EXIT_MULTI_NODE_BLOCKED" "Multi-node setup detected; aborting to avoid an incomplete backup." "Re-run with --i-know-this-is-multi-node to proceed anyway."
+    fi
+    log_warn "Proceeding anyway due to --i-know-this-is-multi-node."
+  fi
+}
+
+# ============================================================================
+# Archive
+# ============================================================================
+
+# build_archive OUT_TAR SRC_DIR ARCHIVE_STEM MEMBER... — tars only the named
+# members of SRC_DIR under a renamed top-level ARCHIVE_STEM/ directory (via
+# GNU tar --transform), so scratch/stderr-capture files left loose in
+# WORKDIR never leak into the shipped archive.
+build_archive() {
+  local out_tar="$1" src_dir="$2" archive_stem="$3"; shift 3
+  if ! tar czf "$out_tar" -C "$src_dir" --transform "s,^,${archive_stem}/," "$@"; then
+    die "$EXIT_ARCHIVE_BUILD_FAILED" "Failed to build archive $out_tar."
+  fi
+}
+
+# checksum_file PATH — prints the sha256 and writes a PATH.sha256 sidecar
+# in `sha256sum -c`-compatible format.
+checksum_file() {
+  local path="$1" sum=""
+  sum=$(sha256sum "$path" | awk '{print $1}')
+  (cd "$(dirname "$path")" && sha256sum "$(basename "$path")" > "$(basename "$path").sha256")
+  printf '%s' "$sum"
+}
+
+# extract_archive ARCHIVE DEST_DIR — extracts and prints the path to the
+# archive's meta.json (dies if missing/corrupt); caller derives the bundle
+# root via `dirname` of the returned path.
+extract_archive() {
+  local archive="$1" dest_dir="$2"
+  [[ -f "$archive" ]] || die "$EXIT_ARCHIVE_INVALID" "Archive not found: $archive"
+  if ! tar xzf "$archive" -C "$dest_dir"; then
+    die "$EXIT_ARCHIVE_INVALID" "Failed to extract archive: $archive"
+  fi
+  local meta=""
+  meta=$(find "$dest_dir" -maxdepth 2 -name meta.json | head -1)
+  if [[ -z "$meta" ]]; then
+    die "$EXIT_ARCHIVE_INVALID" "Archive did not contain the expected meta.json." "This may not be a valid xui-mover backup archive."
+  fi
+  printf '%s' "$meta"
+}
+
+# Hand-rolled flat JSON writer/reader — deliberately no jq dependency, since
+# we fully control meta.json's format (single-level, plus one nested object)
+# and the PRD never requires jq.
+write_meta_json() {
+  local out_file="$1" hostname_v="$2" backend_v="$3" xui_version_v="$4" inbounds_v="$5" users_v="$6" settings_v="$7" nodes_v="$8"
+  cat > "$out_file" <<EOF
+{
+  "tool_version": "${TOOL_VERSION}",
+  "created_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "hostname": "${hostname_v}",
+  "backend": "${backend_v}",
+  "xui_version": "${xui_version_v}",
+  "source_counts": {"inbounds": ${inbounds_v}, "users": ${users_v}, "settings": ${settings_v}, "nodes": ${nodes_v}}
+}
+EOF
+}
+
+read_meta_json_field() {
+  local file="$1" key="$2"
+  grep -oE "\"${key}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$file" 2>/dev/null | head -1 | sed -E "s/^\"${key}\"[[:space:]]*:[[:space:]]*\"([^\"]*)\"\$/\\1/"
+}
+
+read_meta_json_number() {
+  local file="$1" key="$2"
+  grep -oE "\"${key}\"[[:space:]]*:[[:space:]]*[0-9]+" "$file" 2>/dev/null | head -1 | sed -E 's/.*:[[:space:]]*//'
+}
+
+# ============================================================================
+# SSH transfer
+# ============================================================================
+
+# ssh_opts IDENTITY PORT OUT_ARRAY_NAME — builds a shared -o option set via
+# nameref (bash 4.3+, present on all supported Ubuntu/Debian releases).
+ssh_opts() {
+  local identity="$1" port="$2"
+  local -n _out="$3"
+  _out=(-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+  [[ -n "$identity" ]] && _out+=(-i "$identity")
+  [[ -n "$port" ]] && _out+=(-p "$port")
+}
+
+# ssh_test_connection USER_HOST PORT IDENTITY — tries key/agent auth first;
+# if that fails and sshpass is available, prompts for a password and
+# retries (product decision: support both auth modes, not key-only). Sets
+# SSH_USE_PASSWORD/SSH_PASSWORD globals for push_archive() to reuse. Dies
+# with an auth-vs-unreachable-specific hint on total failure.
+ssh_test_connection() {
+  local user_host="$1" port="$2" identity="$3"
+  local opts=()
+  ssh_opts "$identity" "$port" opts
+  if ssh "${opts[@]}" "$user_host" true 2>"$WORKDIR/ssh_test.stderr"; then
+    SSH_USE_PASSWORD=0
+    return 0
+  fi
+  if command -v sshpass >/dev/null 2>&1; then
+    log_warn "Key/agent auth failed for $user_host; falling back to password auth."
+    local pass=""
+    read -r -s -p "SSH password for $user_host: " pass
+    printf '\n'
+    if SSHPASS="$pass" sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no "${opts[@]}" "$user_host" true 2>"$WORKDIR/ssh_test.stderr"; then
+      SSH_PASSWORD="$pass"
+      SSH_USE_PASSWORD=1
+      return 0
+    fi
+  fi
+  local err=""; err=$(cat "$WORKDIR/ssh_test.stderr" 2>/dev/null) || true
+  local hint="Check host/port/user and that the target is reachable."
+  [[ "$err" == *"Permission denied"* ]] && hint="Authentication failed — check your SSH key/password and that the user has SSH access. Install 'sshpass' to enable the password-auth fallback."
+  [[ "$err" == *"Connection timed out"* || "$err" == *"No route to host"* ]] && hint="Host unreachable — check the address/port and firewall rules."
+  die "$EXIT_SSH_FAILED" "Could not establish SSH connection to $user_host." "$hint"
+}
+
+# push_archive USER_HOST PORT IDENTITY LOCAL_TAR REMOTE_DIR — creates the
+# remote dir, scp's the archive + its .sha256 sidecar, then re-hashes the
+# remote copy and compares against the local checksum. Only sets
+# REMOTE_ARCHIVE_PATH (and only reports success) once that comparison
+# passes — matches scp's exit 0 not being sufficient per the PRD's
+# acceptance criteria.
+push_archive() {
+  local user_host="$1" port="$2" identity="$3" local_tar="$4" remote_dir="$5"
+  local opts=() rc=0
+  ssh_opts "$identity" "$port" opts
+  local local_sum=""; local_sum=$(sha256sum "$local_tar" | awk '{print $1}')
+
+  rc=0
+  if [[ "$SSH_USE_PASSWORD" -eq 1 ]]; then
+    SSHPASS="$SSH_PASSWORD" sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no "${opts[@]}" "$user_host" "mkdir -p '$remote_dir'" || rc=$?
+  else
+    ssh "${opts[@]}" "$user_host" "mkdir -p '$remote_dir'" || rc=$?
+  fi
+  [[ $rc -ne 0 ]] && die "$EXIT_PUSH_VERIFY_FAILED" "Failed to create remote directory $remote_dir on $user_host."
+
+  local scp_opts=(-q -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+  [[ -n "$port" ]] && scp_opts+=(-P "$port")
+  [[ -n "$identity" ]] && scp_opts+=(-i "$identity")
+  rc=0
+  if [[ "$SSH_USE_PASSWORD" -eq 1 ]]; then
+    SSHPASS="$SSH_PASSWORD" sshpass -e scp "${scp_opts[@]}" "$local_tar" "${local_tar}.sha256" "${user_host}:${remote_dir}/" || rc=$?
+  else
+    scp "${scp_opts[@]}" "$local_tar" "${local_tar}.sha256" "${user_host}:${remote_dir}/" || rc=$?
+  fi
+  [[ $rc -ne 0 ]] && die "$EXIT_PUSH_VERIFY_FAILED" "File transfer to $user_host failed."
+
+  local remote_sum=""
+  if [[ "$SSH_USE_PASSWORD" -eq 1 ]]; then
+    remote_sum=$(SSHPASS="$SSH_PASSWORD" sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no "${opts[@]}" "$user_host" "sha256sum '${remote_dir}/$(basename "$local_tar")'" 2>/dev/null | awk '{print $1}') || remote_sum=""
+  else
+    remote_sum=$(ssh "${opts[@]}" "$user_host" "sha256sum '${remote_dir}/$(basename "$local_tar")'" 2>/dev/null | awk '{print $1}') || remote_sum=""
+  fi
+
+  if [[ -z "$remote_sum" || "$remote_sum" != "$local_sum" ]]; then
+    die "$EXIT_PUSH_VERIFY_FAILED" "Remote checksum did not match local checksum after transfer." "Local: $local_sum  Remote: ${remote_sum:-<missing>}"
+  fi
+  REMOTE_ARCHIVE_PATH="${remote_dir}/$(basename "$local_tar")"
+}
+
+# ============================================================================
+# Dry-run
+# ============================================================================
+
+# run_step DESCRIPTION FUNC [ARGS...] — mutating operations are called
+# through this wrapper; under --dry-run it prints the intended action and
+# returns 0 without calling FUNC. Read-only detection calls should NOT go
+# through this wrapper, so dry-run summaries stay accurate.
+run_step() {
+  local desc="$1"; shift
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log_info "[DRY RUN] would: $desc"
+    return 0
+  fi
+  "$@"
+}
