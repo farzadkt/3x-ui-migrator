@@ -182,26 +182,28 @@ require_systemd() {
 }
 
 resolve_xui_env_file() {
+  local -n _out="$1"
   local f
   for f in "${XUI_ENV_FILE_CANDIDATES[@]}"; do
-    [[ -r "$f" ]] && { printf '%s' "$f"; return 0; }
+    if [[ -r "$f" ]]; then _out="$f"; return 0; fi
   done
   local shown=""
   shown=$(systemctl show -p EnvironmentFiles "$XUI_SERVICE" 2>/dev/null | sed -E 's/^EnvironmentFiles=//; s/ \(.*\)$//') || true
   if [[ -n "$shown" && -r "$shown" ]]; then
-    printf '%s' "$shown"
+    _out="$shown"
     return 0
   fi
   die "$EXIT_ENV_FILE_MISSING" "Could not find x-ui's environment file." "Expected /etc/default/x-ui — is x-ui installed?"
 }
 
 resolve_xui_bin() {
+  local -n _out="$1"
   local execstart="" path=""
   execstart=$(systemctl show -p ExecStart "$XUI_SERVICE" 2>/dev/null) || true
   path=$(printf '%s' "$execstart" | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2-) || true
   [[ -z "$path" ]] && path="${XUI_MAIN_FOLDER_DEFAULT}/x-ui"
   if [[ -x "$path" ]]; then
-    printf '%s' "$path"
+    _out="$path"
     return 0
   fi
   die "$EXIT_XUI_NOT_INSTALLED" "x-ui binary not found or not executable at: $path" "This tool does not install x-ui — install it first, then re-run."
@@ -210,15 +212,18 @@ resolve_xui_bin() {
 require_xui_installed() {
   systemctl list-unit-files 2>/dev/null | grep -q "^${XUI_SERVICE}\.service" \
     || die "$EXIT_XUI_NOT_INSTALLED" "x-ui systemd service not found." "This tool does not install x-ui — install it first, then re-run."
-  resolve_xui_bin >/dev/null
+  local _bin=""
+  resolve_xui_bin _bin
 }
 
 detect_backend() {
-  local env_file="$1" val=""
+  local env_file="$1"
+  local -n _out="$2"
+  local val=""
   val=$(grep -E '^XUI_DB_TYPE=' "$env_file" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"' \r') || true
   case "${val,,}" in
-    ""|sqlite) printf 'sqlite' ;;
-    postgres|postgresql|pg) printf 'postgres' ;;
+    ""|sqlite) _out="sqlite" ;;
+    postgres|postgresql|pg) _out="postgres" ;;
     *) die "$EXIT_BACKEND_UNKNOWN" "Unrecognized XUI_DB_TYPE value: '$val' in $env_file" ;;
   esac
 }
@@ -275,6 +280,7 @@ pg_dump_to_file() {
 }
 
 pg_sanity_counts() {
+  local -n _inbounds="$1" _users="$2" _settings="$3"
   local inbounds="" users="" settings=""
   inbounds=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc 'SELECT count(*) FROM inbounds;' 2>"$WORKDIR/pg_sanity.stderr") \
     || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'inbounds' failed." "$(cat "$WORKDIR/pg_sanity.stderr" 2>/dev/null)"
@@ -282,7 +288,9 @@ pg_sanity_counts() {
     || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'users' failed." "$(cat "$WORKDIR/pg_sanity.stderr" 2>/dev/null)"
   settings=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc 'SELECT count(*) FROM settings;' 2>"$WORKDIR/pg_sanity.stderr") \
     || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'settings' failed." "$(cat "$WORKDIR/pg_sanity.stderr" 2>/dev/null)"
-  printf '%s %s %s' "${inbounds//[[:space:]]/}" "${users//[[:space:]]/}" "${settings//[[:space:]]/}"
+  _inbounds="${inbounds//[[:space:]]/}"
+  _users="${users//[[:space:]]/}"
+  _settings="${settings//[[:space:]]/}"
 }
 
 sqlite_client_precheck() {
@@ -297,14 +305,18 @@ resolve_sqlite_path() {
 }
 
 sqlite_sanity_counts() {
-  local path="$1" inbounds="" users="" settings=""
+  local path="$1"
+  local -n _inbounds="$2" _users="$3" _settings="$4"
+  local inbounds="" users="" settings=""
   inbounds=$(sqlite3 "$path" 'SELECT count(*) FROM inbounds;' 2>"$WORKDIR/sqlite_sanity.stderr") \
     || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'inbounds' failed." "$(cat "$WORKDIR/sqlite_sanity.stderr" 2>/dev/null)"
   users=$(sqlite3 "$path" 'SELECT count(*) FROM users;' 2>"$WORKDIR/sqlite_sanity.stderr") \
     || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'users' failed." "$(cat "$WORKDIR/sqlite_sanity.stderr" 2>/dev/null)"
   settings=$(sqlite3 "$path" 'SELECT count(*) FROM settings;' 2>"$WORKDIR/sqlite_sanity.stderr") \
     || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'settings' failed." "$(cat "$WORKDIR/sqlite_sanity.stderr" 2>/dev/null)"
-  printf '%s %s %s' "${inbounds//[[:space:]]/}" "${users//[[:space:]]/}" "${settings//[[:space:]]/}"
+  _inbounds="${inbounds//[[:space:]]/}"
+  _users="${users//[[:space:]]/}"
+  _settings="${settings//[[:space:]]/}"
 }
 
 xui_is_active() {
@@ -575,11 +587,11 @@ main() {
   log_info "Working directory: $WORKDIR"
 
   step_banner 2 8 "Detecting backend"
-  local env_file; env_file=$(resolve_xui_env_file)
+  local env_file=""; resolve_xui_env_file env_file
   log_info "Environment file: $env_file"
-  BACKEND=$(detect_backend "$env_file")
-  local xui_bin xui_version
-  xui_bin=$(resolve_xui_bin)
+  detect_backend "$env_file" BACKEND
+  local xui_bin="" xui_version
+  resolve_xui_bin xui_bin
   xui_version=$(get_xui_version "$xui_bin")
   log_info "Backend: $BACKEND   x-ui version: $xui_version"
   if [[ "$BACKEND" == "postgres" ]]; then
@@ -606,7 +618,7 @@ main() {
   if [[ "$BACKEND" == "postgres" ]]; then
     run_step "pg_dump -Fc to $WORKDIR/db/x-ui.dump" pg_dump_to_file "$WORKDIR/db/x-ui.dump"
     if [[ "$DRY_RUN" -eq 0 ]]; then
-      read -r inbounds_count users_count settings_count <<<"$(pg_sanity_counts)"
+      pg_sanity_counts inbounds_count users_count settings_count
     fi
   else
     local was_active=1
@@ -617,7 +629,7 @@ main() {
       run_step "restart x-ui" xui_start_and_wait
     fi
     if [[ "$DRY_RUN" -eq 0 ]]; then
-      read -r inbounds_count users_count settings_count <<<"$(sqlite_sanity_counts "$WORKDIR/db/x-ui.db")"
+      sqlite_sanity_counts "$WORKDIR/db/x-ui.db" inbounds_count users_count settings_count
     fi
   fi
   log_success "Dump complete (inbounds: ${inbounds_count:-0}, users: ${users_count:-0}, settings rows: ${settings_count:-0})"
