@@ -5,7 +5,7 @@
 
 **Languages:** English | [فارسی](README.fa.md)
 
-Migrate a [3x-ui](https://github.com/MHSanaei/3x-ui) panel — inbounds, clients, settings, certs — from one server to another with one guided command on each end.
+Migrate a [3x-ui](https://github.com/MHSanaei/3x-ui) panel — inbounds, clients, users, settings, certs — from one server to another with **one command on the old server and one command on the new server.**
 
 Maintained by [Farzad](https://github.com/farzadkt) at [farzadkt/3x-ui-migrator](https://github.com/farzadkt/3x-ui-migrator).
 
@@ -17,12 +17,14 @@ The official guidance for moving a 3x-ui panel is "copy `/etc/x-ui/` and `/root/
 
 ## Features
 
-- Detects the backend (PostgreSQL or SQLite), panel paths, and x-ui binary automatically — no manual config.
-- Backs up the database, `/root/cert/`, and a reference copy of the environment file into one timestamped, checksummed tarball.
+Everything below is detected automatically; there's nothing to configure by hand.
+
+- Detects the backend (PostgreSQL or SQLite), the panel's database path/DSN, and the x-ui binary/service via systemd — no manual config.
+- Backs up the database, `/root/cert/`, and a reference copy of the environment file into one timestamped, checksummed tarball. Panel login credentials (admin username/password) live inside the database itself, so they're carried over automatically as part of the DB backup — no separate step needed.
 - Restores with an explicit typed `RESTORE` confirmation gate — nothing destructive happens by accident.
 - Post-restore sanity check compares row counts against the source backup and warns on mismatch.
-- Optional direct SSH push (`--push-to`) from source to target, verified by remote checksum comparison.
-- Multi-node installs are detected and blocked by default (only single-node migrations are supported — see [Notes & limitations](#notes--limitations)).
+- Optional direct SSH push (`--push-to`) straight from the old server to the new one, verified by remote checksum comparison — skips the manual `scp` step entirely.
+- Multi-node installs are detected and blocked by default (only single-node migrations are supported — see [Limitations & notes](#limitations--notes)).
 - Every run logs to a file and exits with a distinct, documented code per failure class.
 - `--dry-run` on both scripts to preview what would happen with no changes made.
 
@@ -31,54 +33,47 @@ The official guidance for moving a 3x-ui panel is "copy `/etc/x-ui/` and `/root/
 - Root SSH access to both the old and new server.
 - Debian/Ubuntu with systemd on both ends (matches 3x-ui's own support matrix).
 - x-ui already installed on **both** servers, with the target's backend (Postgres or SQLite) already configured. `restore.sh` does not install x-ui and does not provision a Postgres role/database for you — if the target's Postgres role/db doesn't exist yet, run `x-ui`'s own CLI menu on the target to set it up first, then re-run `restore.sh`.
-- Single-node 3x-ui only (the newer master/node architecture is not supported yet — see [Notes & limitations](#notes--limitations)).
+- Single-node 3x-ui only (the newer master/node architecture is not supported yet — see [Limitations & notes](#limitations--notes)).
 
-## Installation
+## Source server usage
 
-Nothing to install ahead of time — both scripts are self-contained and run directly from the repo via `curl`:
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/farzadkt/3x-ui-migrator/main/backup.sh)
-```
-
-If you'd rather review before running, clone the repo instead:
-
-```bash
-git clone https://github.com/farzadkt/3x-ui-migrator.git
-cd 3x-ui-migrator
-sudo bash backup.sh
-```
-
-## Usage
-
-Run `backup.sh` on the source server, then `restore.sh` on the target server, pointing it at the archive `backup.sh` produced. Both scripts support `-h`/`--help` for the full flag list, and `--dry-run` to preview without changing anything.
-
-## Backup workflow
-
-On the **old** server:
+Run this **one command** on the old server you're migrating away from:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/farzadkt/3x-ui-migrator/main/backup.sh)
 ```
 
-This produces a tarball and prints its path, checksum, and a ready-to-copy `scp` command. Alternatively, push it straight to the new server in one step:
+**What it does:** detects your x-ui install, database backend, and database path/DSN; takes a consistent backup of the database and `/root/cert/`; and packages everything into one checksummed tarball under `/root/xui-mover/`. It prints the archive path and a ready-to-copy `scp` command for step two.
+
+Want to skip the manual copy step? Push the archive straight to the new server in the same command:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/farzadkt/3x-ui-migrator/main/backup.sh) --push-to root@new-server-ip
 ```
 
-**Key flags:**
+## Destination server usage
 
-| Flag | Description |
-|---|---|
-| `--push-to USER@HOST[:PORT]` | Push the archive to a target server over SSH instead of leaving it local |
-| `-i, --identity PATH` | SSH private key to use for `--push-to` |
-| `--remote-dir PATH` | Remote directory to push into (default `/root/xui-mover-incoming`) |
-| `--i-know-this-is-multi-node` | Required to proceed if this panel has registered nodes |
-| `--dry-run` | Print what would happen; make no changes |
-| `-h, --help` | Show full usage |
+Once the archive has landed on the new server (via `scp` or `--push-to`), run this **one command**:
 
-**What's in the archive:**
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/farzadkt/3x-ui-migrator/main/restore.sh) --archive /root/xui-mover-incoming/xui-backup-....tar.gz
+```
+
+**What it does:** detects this server's own x-ui install and configured backend, shows exactly what it's about to overwrite, and — after you type `RESTORE` to confirm — stops x-ui, restores the database and certs, restarts x-ui, and runs a post-restore sanity check comparing row counts against the source.
+
+## Backup flow
+
+What `backup.sh` actually does, in order:
+
+1. Confirms it's running as root on a supported Debian/Ubuntu + systemd host with x-ui installed.
+2. Detects the environment file, backend (Postgres/SQLite), and x-ui version.
+3. Checks for a multi-node setup and aborts (unless overridden) if one is found.
+4. Dumps the database — `pg_dump -Fc` for Postgres, or a clean file copy after briefly stopping x-ui for SQLite — and records row-count sanity totals.
+5. Copies `/root/cert/` and a reference copy of the environment file.
+6. Builds a single timestamped, checksummed tarball.
+7. Prints the local path, or pushes it to the target over SSH if `--push-to` was given.
+
+**Archive contents:**
 
 ```
 xui-backup-<hostname>-<UTC timestamp>.tar.gz
@@ -91,17 +86,37 @@ xui-backup-<hostname>-<UTC timestamp>.tar.gz
 
 **Security note:** the archive is a plain, unencrypted tarball containing database credentials and TLS private keys. Treat it as a secret — delete it after the migration completes, and don't leave it on shared or log-shipped storage.
 
-## Restore workflow
+## Restore flow
 
-On the **new** server, once the archive has landed there:
+What `restore.sh` actually does, in order:
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/farzadkt/3x-ui-migrator/main/restore.sh) --archive /root/xui-mover-incoming/xui-backup-....tar.gz
-```
+1. Confirms it's running as root on a supported host with x-ui installed, and detects this server's own backend/DSN.
+2. Extracts the archive and checks its backend matches this server's configured backend.
+3. Prints exactly what will be overwritten and requires you to type `RESTORE` (or pass `--yes --confirm-restore` for scripted use — `--yes` alone is never enough).
+4. Stops x-ui.
+5. Restores the database (`pg_restore --no-owner -c --if-exists` for Postgres, or a file copy + `PRAGMA integrity_check` for SQLite).
+6. Restores certs into `/root/cert/`.
+7. Starts x-ui and waits for it to become active.
+8. Runs the post-restore sanity check and prints a summary.
 
-`restore.sh` shows exactly what it's about to overwrite and requires you to type `RESTORE` before touching anything. Type anything else and it aborts with zero changes made.
+Every run logs to `/var/log/xui-mover-<timestamp>.log` (ANSI stripped) — attach this file when asking for help. Any failure after x-ui has been stopped automatically prints the last ~20 lines of the x-ui log so you don't have to go hunting for it.
 
-**Key flags:**
+## Flags reference
+
+### `backup.sh`
+
+| Flag | Description |
+|---|---|
+| `--push-to USER@HOST[:PORT]` | Push the archive to a target server over SSH instead of leaving it local |
+| `-i, --identity PATH` | SSH private key to use for `--push-to` |
+| `--remote-dir PATH` | Remote directory to push into (default `/root/xui-mover-incoming`) |
+| `--i-know-this-is-multi-node` | Required to proceed if this panel has registered nodes |
+| `--yes` | Assume yes on informational prompts (does not bypass the multi-node guard) |
+| `--dry-run` | Print what would happen; make no changes |
+| `--no-color` | Disable colored output |
+| `-h, --help` | Show full usage |
+
+### `restore.sh`
 
 | Flag | Description |
 |---|---|
@@ -109,11 +124,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/farzadkt/3x-ui-migrator/main
 | `--yes` | Non-interactive mode — **requires** `--confirm-restore` too |
 | `--confirm-restore` | Explicit non-interactive equivalent of typing `RESTORE` at the safety prompt |
 | `--dry-run` | Print what would happen; make no changes |
+| `--no-color` | Disable colored output |
 | `-h, --help` | Show full usage |
-
-`--yes` alone never skips the destructive-action confirmation — it must be paired with `--confirm-restore`, so scripted/CI use can never silently bypass the safety gate.
-
-Every run logs to `/var/log/xui-mover-<timestamp>.log` (ANSI stripped) — attach this file when asking for help. Any failure after `restore.sh` has stopped x-ui automatically prints the last ~20 lines of the x-ui log so you don't have to go hunting for it.
 
 ## Exit codes
 
@@ -136,7 +148,7 @@ Every failure exits with a distinct, documented code — never a bare `exit 1` �
 | 12 | Database dump failed | 26 | Invalid flag combination |
 | 13 | Archive build (`tar`) failed | | |
 
-## Notes & limitations
+## Limitations & notes
 
 - **Single-node only.** If `backup.sh` detects rows in the `nodes` table, it warns loudly and refuses to proceed without `--i-know-this-is-multi-node` — and even then, only master-node data (inbounds/settings/certs) is backed up; per-node API tokens/config are not migrated.
 - **Same-or-compatible x-ui schema version assumed.** Migrating across incompatible x-ui schema versions is out of scope.
