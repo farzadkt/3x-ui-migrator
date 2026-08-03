@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `backup.sh`/`restore.sh`/`lib/common.sh`: the post-dump and post-restore sanity-check row counts (`pg_sanity_counts`/`sqlite_sanity_counts`) are no longer read via `read ... <<<"$(...)"`. That pattern ran the whole function inside a command substitution, so a query failure's `die` only killed the subshell — `read` then "succeeded" against empty output, the count variables ended up empty, and the script continued as if nothing had gone wrong (a restore whose sanity check itself errored was reported as a successful restore, exit 0, instead of `EXIT_SANITY_CHECK_FAILED`). `resolve_xui_env_file`, `resolve_xui_bin`, `detect_backend`, and `extract_archive` (restore.sh) are changed the same way for consistency and to remove the underlying subshell-capture pattern entirely, even though their exit codes already survived via the `ERR` trap's passthrough. All five functions now write their result into a caller-supplied variable via `local -n` (the same pattern already used by `ssh_opts`) instead of printing for `$(...)` capture, so a `die()` inside them always terminates the real script process with its intended exit code and message. See `AUDIT.md` §1.1/§1.2.
+
 ### Added
 
 - `backup.sh`/`restore.sh`: row-count sanity check now also covers the `settings` table (alongside `inbounds`/`users`), recorded in `meta.json`'s `source_counts` and compared post-restore with a warning on mismatch. The `settings` table holds the panel's global settings *and* the Xray Configuration template (outbounds/routing/DNS), so this gives an immediate signal that the table came across intact, distinguishing a genuine restore gap from x-ui itself failing to render already-migrated data.

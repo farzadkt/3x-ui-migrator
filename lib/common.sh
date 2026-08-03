@@ -239,15 +239,23 @@ require_systemd() {
 
 # Finds x-ui's environment file: checks the known candidate paths first,
 # falls back to asking systemd what it actually configured.
+#
+# resolve_xui_env_file OUT_VAR — writes the result into OUT_VAR (nameref)
+# instead of printing it for `$(...)` capture. A `die` inside a command
+# substitution only kills that subshell, not the script (set -e then trips
+# the generic ERR trap and both the real exit code and message are lost) —
+# see AUDIT.md #1.1. Running in the caller's own shell via nameref avoids
+# that entirely.
 resolve_xui_env_file() {
+  local -n _out="$1"
   local f
   for f in "${XUI_ENV_FILE_CANDIDATES[@]}"; do
-    [[ -r "$f" ]] && { printf '%s' "$f"; return 0; }
+    if [[ -r "$f" ]]; then _out="$f"; return 0; fi
   done
   local shown=""
   shown=$(systemctl show -p EnvironmentFiles "$XUI_SERVICE" 2>/dev/null | sed -E 's/^EnvironmentFiles=//; s/ \(.*\)$//') || true
   if [[ -n "$shown" && -r "$shown" ]]; then
-    printf '%s' "$shown"
+    _out="$shown"
     return 0
   fi
   die "$EXIT_ENV_FILE_MISSING" "Could not find x-ui's environment file." "Expected /etc/default/x-ui — is x-ui installed?"
@@ -255,13 +263,17 @@ resolve_xui_env_file() {
 
 # Finds the x-ui binary via systemd's ExecStart, falling back to the
 # documented default install path. Dies if nothing executable is found.
+#
+# resolve_xui_bin OUT_VAR — see resolve_xui_env_file above for why this is a
+# nameref out-param rather than a `$(...)`-captured return value.
 resolve_xui_bin() {
+  local -n _out="$1"
   local execstart="" path=""
   execstart=$(systemctl show -p ExecStart "$XUI_SERVICE" 2>/dev/null) || true
   path=$(printf '%s' "$execstart" | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2-) || true
   [[ -z "$path" ]] && path="${XUI_MAIN_FOLDER_DEFAULT}/x-ui"
   if [[ -x "$path" ]]; then
-    printf '%s' "$path"
+    _out="$path"
     return 0
   fi
   die "$EXIT_XUI_NOT_INSTALLED" "x-ui binary not found or not executable at: $path" "This tool does not install x-ui — install it first, then re-run."
@@ -270,17 +282,21 @@ resolve_xui_bin() {
 require_xui_installed() {
   systemctl list-unit-files 2>/dev/null | grep -q "^${XUI_SERVICE}\.service" \
     || die "$EXIT_XUI_NOT_INSTALLED" "x-ui systemd service not found." "This tool does not install x-ui — install it first, then re-run."
-  resolve_xui_bin >/dev/null
+  local _bin=""
+  resolve_xui_bin _bin
 }
 
-# detect_backend ENV_FILE — reads XUI_DB_TYPE, normalizes to "postgres" or
-# "sqlite". Dies on anything else.
+# detect_backend ENV_FILE OUT_VAR — reads XUI_DB_TYPE, writes "postgres" or
+# "sqlite" into OUT_VAR (nameref). Dies on anything else. See
+# resolve_xui_env_file above for why this isn't a `$(...)`-captured return.
 detect_backend() {
-  local env_file="$1" val=""
+  local env_file="$1"
+  local -n _out="$2"
+  local val=""
   val=$(grep -E '^XUI_DB_TYPE=' "$env_file" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"' \r') || true
   case "${val,,}" in
-    ""|sqlite) printf 'sqlite' ;;
-    postgres|postgresql|pg) printf 'postgres' ;;
+    ""|sqlite) _out="sqlite" ;;
+    postgres|postgresql|pg) _out="postgres" ;;
     *) die "$EXIT_BACKEND_UNKNOWN" "Unrecognized XUI_DB_TYPE value: '$val' in $env_file" ;;
   esac
 }
@@ -369,14 +385,19 @@ pg_restore_from_file() {
   fi
 }
 
-# pg_sanity_counts — prints "INBOUNDS_COUNT USERS_COUNT SETTINGS_COUNT". Dies
-# only on a genuine query error, not on a legitimate zero count. The
-# settings-table count exists because that single table holds the panel's
-# global settings *and* the Xray Configuration template (outbounds/routing/
-# DNS, stored as one JSON blob under key "xrayTemplateConfig") — comparing
-# its row count pre/post restore catches "the settings table itself didn't
-# come across" without needing to parse the JSON.
+# pg_sanity_counts OUT_INBOUNDS OUT_USERS OUT_SETTINGS — writes the three
+# counts into the given namerefs. Dies only on a genuine query error, not on
+# a legitimate zero count — but see resolve_xui_env_file above: this must be
+# called directly (never via `read ... <<<"$(pg_sanity_counts)"`), otherwise
+# that die() only kills the subshell and the failure is silently swallowed
+# (AUDIT.md #1.2). The settings-table count exists because that single table
+# holds the panel's global settings *and* the Xray Configuration template
+# (outbounds/routing/DNS, stored as one JSON blob under key
+# "xrayTemplateConfig") — comparing its row count pre/post restore catches
+# "the settings table itself didn't come across" without needing to parse
+# the JSON.
 pg_sanity_counts() {
+  local -n _inbounds="$1" _users="$2" _settings="$3"
   local inbounds="" users="" settings=""
   inbounds=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc 'SELECT count(*) FROM inbounds;' 2>"$WORKDIR/pg_sanity.stderr") \
     || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'inbounds' failed." "$(cat "$WORKDIR/pg_sanity.stderr" 2>/dev/null)"
@@ -384,7 +405,9 @@ pg_sanity_counts() {
     || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'users' failed." "$(cat "$WORKDIR/pg_sanity.stderr" 2>/dev/null)"
   settings=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc 'SELECT count(*) FROM settings;' 2>"$WORKDIR/pg_sanity.stderr") \
     || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'settings' failed." "$(cat "$WORKDIR/pg_sanity.stderr" 2>/dev/null)"
-  printf '%s %s %s' "${inbounds//[[:space:]]/}" "${users//[[:space:]]/}" "${settings//[[:space:]]/}"
+  _inbounds="${inbounds//[[:space:]]/}"
+  _users="${users//[[:space:]]/}"
+  _settings="${settings//[[:space:]]/}"
 }
 
 # ============================================================================
@@ -410,15 +433,21 @@ sqlite_integrity_check() {
   [[ "$result" == "ok" ]]
 }
 
+# sqlite_sanity_counts PATH OUT_INBOUNDS OUT_USERS OUT_SETTINGS — see
+# pg_sanity_counts above: must be called directly, not via `$(...)` capture.
 sqlite_sanity_counts() {
-  local path="$1" inbounds="" users="" settings=""
+  local path="$1"
+  local -n _inbounds="$2" _users="$3" _settings="$4"
+  local inbounds="" users="" settings=""
   inbounds=$(sqlite3 "$path" 'SELECT count(*) FROM inbounds;' 2>"$WORKDIR/sqlite_sanity.stderr") \
     || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'inbounds' failed." "$(cat "$WORKDIR/sqlite_sanity.stderr" 2>/dev/null)"
   users=$(sqlite3 "$path" 'SELECT count(*) FROM users;' 2>"$WORKDIR/sqlite_sanity.stderr") \
     || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'users' failed." "$(cat "$WORKDIR/sqlite_sanity.stderr" 2>/dev/null)"
   settings=$(sqlite3 "$path" 'SELECT count(*) FROM settings;' 2>"$WORKDIR/sqlite_sanity.stderr") \
     || die "$EXIT_SANITY_CHECK_FAILED" "Sanity-check query on 'settings' failed." "$(cat "$WORKDIR/sqlite_sanity.stderr" 2>/dev/null)"
-  printf '%s %s %s' "${inbounds//[[:space:]]/}" "${users//[[:space:]]/}" "${settings//[[:space:]]/}"
+  _inbounds="${inbounds//[[:space:]]/}"
+  _users="${users//[[:space:]]/}"
+  _settings="${settings//[[:space:]]/}"
 }
 
 # ============================================================================
@@ -539,11 +568,13 @@ checksum_file() {
   printf '%s' "$sum"
 }
 
-# extract_archive ARCHIVE DEST_DIR — extracts and prints the path to the
-# archive's meta.json (dies if missing/corrupt); caller derives the bundle
-# root via `dirname` of the returned path.
+# extract_archive ARCHIVE DEST_DIR OUT_VAR — extracts and writes the path to
+# the archive's meta.json into OUT_VAR (nameref); dies if missing/corrupt.
+# Caller derives the bundle root via `dirname` of that path. Nameref rather
+# than `$(...)` capture — see resolve_xui_env_file above.
 extract_archive() {
   local archive="$1" dest_dir="$2"
+  local -n _out="$3"
   [[ -f "$archive" ]] || die "$EXIT_ARCHIVE_INVALID" "Archive not found: $archive"
   if ! tar xzf "$archive" -C "$dest_dir"; then
     die "$EXIT_ARCHIVE_INVALID" "Failed to extract archive: $archive"
@@ -553,7 +584,7 @@ extract_archive() {
   if [[ -z "$meta" ]]; then
     die "$EXIT_ARCHIVE_INVALID" "Archive did not contain the expected meta.json." "This may not be a valid xui-mover backup archive."
   fi
-  printf '%s' "$meta"
+  _out="$meta"
 }
 
 # Hand-rolled flat JSON writer/reader — deliberately no jq dependency, since
