@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- `backup.sh`/`restore.sh`/`lib/common.sh`: replaced the hardcoded `XUI_SERVICE="x-ui"` assumption and its `/usr/local/x-ui` fallback path with `discover_xui_installation`, which scans every systemd service unit for one that plausibly refers to x-ui/3x-ui and verifies each candidate's `ExecStart` actually resolves to an existing, executable binary before trusting it. Auto-selects when exactly one valid installation is found; prompts interactively to choose when more than one is found; dies with `EXIT_XUI_NOT_INSTALLED` when none are found. `XUI_MAIN_FOLDER_DEFAULT` is removed as it's no longer needed.
+
 ### Fixed
 
 - `backup.sh`/`restore.sh`/`lib/common.sh`: the post-dump and post-restore sanity-check row counts (`pg_sanity_counts`/`sqlite_sanity_counts`) are no longer read via `read ... <<<"$(...)"`. That pattern ran the whole function inside a command substitution, so a query failure's `die` only killed the subshell — `read` then "succeeded" against empty output, the count variables ended up empty, and the script continued as if nothing had gone wrong (a restore whose sanity check itself errored was reported as a successful restore, exit 0, instead of `EXIT_SANITY_CHECK_FAILED`). `resolve_xui_env_file`, `resolve_xui_bin`, `detect_backend`, and `extract_archive` (restore.sh) are changed the same way for consistency and to remove the underlying subshell-capture pattern entirely, even though their exit codes already survived via the `ERR` trap's passthrough. All five functions now write their result into a caller-supplied variable via `local -n` (the same pattern already used by `ssh_opts`) instead of printing for `$(...)` capture, so a `die()` inside them always terminates the real script process with its intended exit code and message. See `AUDIT.md` §1.1/§1.2.

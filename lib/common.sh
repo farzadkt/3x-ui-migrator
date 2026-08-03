@@ -26,8 +26,6 @@
 # non-goals, but resolve_xui_env_file() checks the others too as a defensive
 # fallback before giving up.
 readonly XUI_ENV_FILE_CANDIDATES=(/etc/default/x-ui /etc/conf.d/x-ui /etc/sysconfig/x-ui)
-readonly XUI_SERVICE="x-ui"
-readonly XUI_MAIN_FOLDER_DEFAULT="/usr/local/x-ui"
 readonly XUI_SQLITE_FOLDER_DEFAULT="/etc/x-ui"
 readonly XUI_SQLITE_FILENAME="x-ui.db"
 readonly XUI_CERT_DIR="/root/cert"
@@ -82,6 +80,7 @@ ASSUME_YES=0                # set by --yes
 WORKDIR=""                   # set by make_workdir()
 LOG_FILE=""                   # set by setup_logging()
 SERVICE_STOPPED=0              # set to 1 once xui_stop_and_wait() begins; die() tails logs when 1
+XUI_SERVICE=""                   # discovered at runtime by discover_xui_installation — never hardcoded
 PG_USER=""; PG_PASS=""; PG_HOST=""; PG_PORT=""; PG_DB=""; PG_CONN_NOAUTH=""
 SSH_USE_PASSWORD=0; SSH_PASSWORD=""
 
@@ -261,29 +260,68 @@ resolve_xui_env_file() {
   die "$EXIT_ENV_FILE_MISSING" "Could not find x-ui's environment file." "Expected /etc/default/x-ui — is x-ui installed?"
 }
 
-# Finds the x-ui binary via systemd's ExecStart, falling back to the
-# documented default install path. Dies if nothing executable is found.
-#
-# resolve_xui_bin OUT_VAR — see resolve_xui_env_file above for why this is a
-# nameref out-param rather than a `$(...)`-captured return value.
-resolve_xui_bin() {
-  local -n _out="$1"
-  local execstart="" path=""
-  execstart=$(systemctl show -p ExecStart "$XUI_SERVICE" 2>/dev/null) || true
-  path=$(printf '%s' "$execstart" | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2-) || true
-  [[ -z "$path" ]] && path="${XUI_MAIN_FOLDER_DEFAULT}/x-ui"
-  if [[ -x "$path" ]]; then
-    _out="$path"
+# discover_xui_installation OUT_SERVICE OUT_BIN — finds x-ui's systemd unit
+# and executable without assuming any fixed unit name or install path (see
+# AUDIT.md §7 — the old resolve_xui_bin/require_xui_installed pair assumed
+# XUI_SERVICE="x-ui" and fell back to a hardcoded /usr/local/x-ui/x-ui).
+# Scans every systemd service unit for one whose name plausibly refers to
+# x-ui/3x-ui, then keeps only the candidates whose ExecStart actually
+# resolves to an existing, executable binary (filters out unrelated units
+# that merely contain "xui" in their name). Dies if no candidate survives;
+# auto-selects if exactly one does; prompts interactively to choose if more
+# than one does. Writes the chosen unit name (without ".service") and the
+# absolute binary path into the two namerefs.
+discover_xui_installation() {
+  local -n _svc_out="$1" _bin_out="$2"
+  local unit_names="" u svc path execstart install_dir version
+  local -a cand_svc=() cand_bin=()
+
+  unit_names=$(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -iE 'x-?ui') || true
+
+  for u in $unit_names; do
+    svc="${u%.service}"
+    execstart=$(systemctl show -p ExecStart "$svc" 2>/dev/null) || true
+    path=$(printf '%s' "$execstart" | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2-) || true
+    [[ -n "$path" && -x "$path" ]] || continue
+    cand_svc+=("$svc")
+    cand_bin+=("$path")
+  done
+
+  if [[ ${#cand_svc[@]} -eq 0 ]]; then
+    die "$EXIT_XUI_NOT_INSTALLED" "No x-ui systemd service with a valid, executable binary was found." "This tool does not install x-ui — install it first, then re-run. Searched every systemd service unit for a name containing 'x-ui'/'xui'."
+  fi
+
+  if [[ ${#cand_svc[@]} -eq 1 ]]; then
+    _svc_out="${cand_svc[0]}"
+    _bin_out="${cand_bin[0]}"
+    install_dir="$(dirname "$_bin_out")"
+    version="$(get_xui_version "$_bin_out")"
+    log_success "Discovered x-ui installation: service '${_svc_out}.service', path $install_dir, binary $_bin_out, version $version"
     return 0
   fi
-  die "$EXIT_XUI_NOT_INSTALLED" "x-ui binary not found or not executable at: $path" "This tool does not install x-ui — install it first, then re-run."
-}
 
-require_xui_installed() {
-  systemctl list-unit-files 2>/dev/null | grep -q "^${XUI_SERVICE}\.service" \
-    || die "$EXIT_XUI_NOT_INSTALLED" "x-ui systemd service not found." "This tool does not install x-ui — install it first, then re-run."
-  local _bin=""
-  resolve_xui_bin _bin
+  print_box "MULTIPLE X-UI-LIKE INSTALLATIONS FOUND" "Select which one this migration should use:"
+  local i
+  for i in "${!cand_svc[@]}"; do
+    version="$(get_xui_version "${cand_bin[$i]}")"
+    printf '  %s%d)%s %s.service  —  %s  (version: %s)\n' "$C_BOLD" "$((i + 1))" "$C_RESET" "${cand_svc[$i]}" "${cand_bin[$i]}" "$version"
+  done
+
+  if [[ ! -t 0 ]]; then
+    die "$EXIT_BAD_ARGS" "Multiple x-ui-like installations found and this session is not interactive." "Re-run interactively (a real terminal, not piped/redirected input) to choose one."
+  fi
+
+  local choice=""
+  while true; do
+    read -r -p "Enter a number (1-${#cand_svc[@]}): " choice || choice=""
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#cand_svc[@]} )); then
+      break
+    fi
+    log_warn "Invalid selection: '$choice'"
+  done
+  _svc_out="${cand_svc[$((choice - 1))]}"
+  _bin_out="${cand_bin[$((choice - 1))]}"
+  log_success "Selected: service '${_svc_out}.service', binary $_bin_out"
 }
 
 # detect_backend ENV_FILE OUT_VAR — reads XUI_DB_TYPE, writes "postgres" or
