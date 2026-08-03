@@ -26,8 +26,6 @@
 # non-goals, but resolve_xui_env_file() checks the others too as a defensive
 # fallback before giving up.
 readonly XUI_ENV_FILE_CANDIDATES=(/etc/default/x-ui /etc/conf.d/x-ui /etc/sysconfig/x-ui)
-readonly XUI_SERVICE="x-ui"
-readonly XUI_MAIN_FOLDER_DEFAULT="/usr/local/x-ui"
 readonly XUI_SQLITE_FOLDER_DEFAULT="/etc/x-ui"
 readonly XUI_SQLITE_FILENAME="x-ui.db"
 readonly XUI_CERT_DIR="/root/cert"
@@ -82,6 +80,7 @@ ASSUME_YES=0                # set by --yes
 WORKDIR=""                   # set by make_workdir()
 LOG_FILE=""                   # set by setup_logging()
 SERVICE_STOPPED=0              # set to 1 once xui_stop_and_wait() begins; die() tails logs when 1
+XUI_SERVICE=""                   # discovered at runtime by discover_xui_installation — never hardcoded
 PG_USER=""; PG_PASS=""; PG_HOST=""; PG_PORT=""; PG_DB=""; PG_CONN_NOAUTH=""
 SSH_USE_PASSWORD=0; SSH_PASSWORD=""
 
@@ -195,10 +194,17 @@ confirm_typed() {
 # ============================================================================
 
 # Creates $WORK_ROOT/run-<ts>-$$ (mode 700) and sets WORKDIR to it.
+# `mkdir -p -m` only applies the mode to directories it actually creates — a
+# pre-existing WORK_ROOT (e.g. left over from an older version, or created
+# some other way) would silently keep whatever permissions it already had.
+# chmod explicitly so a credential-bearing directory is never left more
+# permissive than 700 regardless of prior state.
 make_workdir() {
-  mkdir -p -m 700 "$WORK_ROOT"
+  mkdir -p "$WORK_ROOT"
+  chmod 700 "$WORK_ROOT"
   WORKDIR="${WORK_ROOT}/run-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  mkdir -p -m 700 "$WORKDIR"
+  mkdir -p "$WORKDIR"
+  chmod 700 "$WORKDIR"
 }
 
 # Removes WORKDIR on exit (success or failure). Path-guarded so a bad
@@ -261,29 +267,68 @@ resolve_xui_env_file() {
   die "$EXIT_ENV_FILE_MISSING" "Could not find x-ui's environment file." "Expected /etc/default/x-ui — is x-ui installed?"
 }
 
-# Finds the x-ui binary via systemd's ExecStart, falling back to the
-# documented default install path. Dies if nothing executable is found.
-#
-# resolve_xui_bin OUT_VAR — see resolve_xui_env_file above for why this is a
-# nameref out-param rather than a `$(...)`-captured return value.
-resolve_xui_bin() {
-  local -n _out="$1"
-  local execstart="" path=""
-  execstart=$(systemctl show -p ExecStart "$XUI_SERVICE" 2>/dev/null) || true
-  path=$(printf '%s' "$execstart" | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2-) || true
-  [[ -z "$path" ]] && path="${XUI_MAIN_FOLDER_DEFAULT}/x-ui"
-  if [[ -x "$path" ]]; then
-    _out="$path"
+# discover_xui_installation OUT_SERVICE OUT_BIN — finds x-ui's systemd unit
+# and executable without assuming any fixed unit name or install path (see
+# AUDIT.md §7 — the old resolve_xui_bin/require_xui_installed pair assumed
+# XUI_SERVICE="x-ui" and fell back to a hardcoded /usr/local/x-ui/x-ui).
+# Scans every systemd service unit for one whose name plausibly refers to
+# x-ui/3x-ui, then keeps only the candidates whose ExecStart actually
+# resolves to an existing, executable binary (filters out unrelated units
+# that merely contain "xui" in their name). Dies if no candidate survives;
+# auto-selects if exactly one does; prompts interactively to choose if more
+# than one does. Writes the chosen unit name (without ".service") and the
+# absolute binary path into the two namerefs.
+discover_xui_installation() {
+  local -n _svc_out="$1" _bin_out="$2"
+  local unit_names="" u svc path execstart install_dir version
+  local -a cand_svc=() cand_bin=()
+
+  unit_names=$(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -iE 'x-?ui') || true
+
+  for u in $unit_names; do
+    svc="${u%.service}"
+    execstart=$(systemctl show -p ExecStart "$svc" 2>/dev/null) || true
+    path=$(printf '%s' "$execstart" | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2-) || true
+    [[ -n "$path" && -x "$path" ]] || continue
+    cand_svc+=("$svc")
+    cand_bin+=("$path")
+  done
+
+  if [[ ${#cand_svc[@]} -eq 0 ]]; then
+    die "$EXIT_XUI_NOT_INSTALLED" "No x-ui systemd service with a valid, executable binary was found." "This tool does not install x-ui — install it first, then re-run. Searched every systemd service unit for a name containing 'x-ui'/'xui'."
+  fi
+
+  if [[ ${#cand_svc[@]} -eq 1 ]]; then
+    _svc_out="${cand_svc[0]}"
+    _bin_out="${cand_bin[0]}"
+    install_dir="$(dirname "$_bin_out")"
+    version="$(get_xui_version "$_bin_out")"
+    log_success "Discovered x-ui installation: service '${_svc_out}.service', path $install_dir, binary $_bin_out, version $version"
     return 0
   fi
-  die "$EXIT_XUI_NOT_INSTALLED" "x-ui binary not found or not executable at: $path" "This tool does not install x-ui — install it first, then re-run."
-}
 
-require_xui_installed() {
-  systemctl list-unit-files 2>/dev/null | grep -q "^${XUI_SERVICE}\.service" \
-    || die "$EXIT_XUI_NOT_INSTALLED" "x-ui systemd service not found." "This tool does not install x-ui — install it first, then re-run."
-  local _bin=""
-  resolve_xui_bin _bin
+  print_box "MULTIPLE X-UI-LIKE INSTALLATIONS FOUND" "Select which one this migration should use:"
+  local i
+  for i in "${!cand_svc[@]}"; do
+    version="$(get_xui_version "${cand_bin[$i]}")"
+    printf '  %s%d)%s %s.service  —  %s  (version: %s)\n' "$C_BOLD" "$((i + 1))" "$C_RESET" "${cand_svc[$i]}" "${cand_bin[$i]}" "$version"
+  done
+
+  if [[ ! -t 0 ]]; then
+    die "$EXIT_BAD_ARGS" "Multiple x-ui-like installations found and this session is not interactive." "Re-run interactively (a real terminal, not piped/redirected input) to choose one."
+  fi
+
+  local choice=""
+  while true; do
+    read -r -p "Enter a number (1-${#cand_svc[@]}): " choice || choice=""
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#cand_svc[@]} )); then
+      break
+    fi
+    log_warn "Invalid selection: '$choice'"
+  done
+  _svc_out="${cand_svc[$((choice - 1))]}"
+  _bin_out="${cand_bin[$((choice - 1))]}"
+  log_success "Selected: service '${_svc_out}.service', binary $_bin_out"
 }
 
 # detect_backend ENV_FILE OUT_VAR — reads XUI_DB_TYPE, writes "postgres" or
@@ -427,6 +472,36 @@ resolve_sqlite_path() {
   printf '%s/%s' "$folder" "$XUI_SQLITE_FILENAME"
 }
 
+# sqlite_copy_with_sidecars SRC DEST — copies SRC to DEST, and also copies
+# SRC-wal/SRC-shm to DEST-wal/DEST-shm if they exist. In WAL mode, recently
+# committed rows can still live only in the -wal file, not yet checkpointed
+# into the main .db file; copying just the .db (the old behavior) risked a
+# snapshot that silently missed those rows, or — on restore — risked a
+# stale target -wal being replayed over a freshly restored .db. Copying all
+# three as one matched set (only ever done while x-ui is stopped, so there
+# is no concurrent writer) guarantees the fileset is internally consistent.
+# See AUDIT.md §10.1. Used by both backup.sh (workdir copy) and restore.sh
+# (bundle -> target copy) — same operation either direction.
+sqlite_copy_with_sidecars() {
+  local src="$1" dest="$2" side
+  cp -p "$src" "$dest"
+  for side in "-wal" "-shm"; do
+    if [[ -f "${src}${side}" ]]; then
+      cp -p "${src}${side}" "${dest}${side}"
+    fi
+  done
+}
+
+# sqlite_remove_sidecars PATH — removes PATH-wal/PATH-shm if present. Used
+# by restore.sh before placing a freshly restored .db so a stale leftover
+# -wal from the target's previous database can never be replayed over it.
+sqlite_remove_sidecars() {
+  local path="$1" side
+  for side in "-wal" "-shm"; do
+    rm -f "${path}${side}"
+  done
+}
+
 sqlite_integrity_check() {
   local path="$1" result=""
   result=$(sqlite3 "$path" 'PRAGMA integrity_check;' 2>"$WORKDIR/sqlite_check.stderr") || result=""
@@ -568,14 +643,52 @@ checksum_file() {
   printf '%s' "$sum"
 }
 
+# verify_local_checksum PATH — re-reads PATH from disk (backup.sh side) and
+# checks it against the .sha256 sidecar checksum_file() just wrote,
+# independently of that write. Catches the archive having been
+# altered/truncated/corrupted between being built and being read back (bad
+# disk, race with another process, etc.) instead of trusting the in-memory
+# value computed a moment earlier. Uses EXIT_CHECKSUM_MISMATCH, which was
+# previously defined but never actually triggered by any code path
+# (AUDIT.md §13).
+verify_local_checksum() {
+  local path="$1" sidecar="${1}.sha256"
+  [[ -f "$sidecar" ]] || die "$EXIT_CHECKSUM_MISMATCH" "Checksum sidecar file not found: $sidecar"
+  if ! (cd "$(dirname "$path")" && sha256sum -c "$(basename "$sidecar")") >/dev/null 2>"$WORKDIR/checksum_verify.stderr"; then
+    die "$EXIT_CHECKSUM_MISMATCH" "Local checksum verification failed for $path." "The archive on disk does not match its own recorded checksum — do not transfer or restore from it. Re-run backup.sh."
+  fi
+}
+
+# verify_archive_checksum_if_present ARCHIVE — restore.sh side counterpart:
+# if ARCHIVE.sha256 sits next to the archive (always true after --push-to,
+# since push_archive() ships both files together; true for a manual scp
+# only if the sidecar was copied too), verifies the archive against it and
+# dies with EXIT_CHECKSUM_MISMATCH on a mismatch. If the sidecar isn't
+# present, this is a no-op — the structural check in extract_archive() below
+# still runs regardless.
+verify_archive_checksum_if_present() {
+  local archive="$1" sidecar="${1}.sha256"
+  [[ -f "$sidecar" ]] || { log_info "No .sha256 sidecar found next to the archive — skipping checksum verification."; return 0; }
+  if ! (cd "$(dirname "$archive")" && sha256sum -c "$(basename "$sidecar")") >/dev/null 2>"$WORKDIR/checksum_verify.stderr"; then
+    die "$EXIT_CHECKSUM_MISMATCH" "Archive checksum verification failed against $(basename "$sidecar")." "The archive does not match its recorded checksum — do not proceed. Re-transfer it from the source."
+  fi
+  log_success "Archive checksum verified against $(basename "$sidecar")"
+}
+
 # extract_archive ARCHIVE DEST_DIR OUT_VAR — extracts and writes the path to
 # the archive's meta.json into OUT_VAR (nameref); dies if missing/corrupt.
 # Caller derives the bundle root via `dirname` of that path. Nameref rather
-# than `$(...)` capture — see resolve_xui_env_file above.
+# than `$(...)` capture — see resolve_xui_env_file above. Runs `tar tzf`
+# first (structural check only, no extraction) so a truncated/corrupted
+# archive is caught with a clear message instead of a partial extraction or
+# a confusing downstream failure.
 extract_archive() {
   local archive="$1" dest_dir="$2"
   local -n _out="$3"
   [[ -f "$archive" ]] || die "$EXIT_ARCHIVE_INVALID" "Archive not found: $archive"
+  if ! tar tzf "$archive" >/dev/null 2>"$WORKDIR/tar_test.stderr"; then
+    die "$EXIT_ARCHIVE_INVALID" "Archive failed integrity check (corrupt or truncated): $archive" "$(cat "$WORKDIR/tar_test.stderr" 2>/dev/null)"
+  fi
   if ! tar xzf "$archive" -C "$dest_dir"; then
     die "$EXIT_ARCHIVE_INVALID" "Failed to extract archive: $archive"
   fi

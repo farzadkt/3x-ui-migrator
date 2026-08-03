@@ -29,8 +29,6 @@ set -Eeuo pipefail
 # ============================================================================
 
 readonly XUI_ENV_FILE_CANDIDATES=(/etc/default/x-ui /etc/conf.d/x-ui /etc/sysconfig/x-ui)
-readonly XUI_SERVICE="x-ui"
-readonly XUI_MAIN_FOLDER_DEFAULT="/usr/local/x-ui"
 readonly XUI_SQLITE_FOLDER_DEFAULT="/etc/x-ui"
 readonly XUI_SQLITE_FILENAME="x-ui.db"
 readonly XUI_CERT_DIR="/root/cert"
@@ -72,6 +70,7 @@ ASSUME_YES=0
 WORKDIR=""
 LOG_FILE=""
 SERVICE_STOPPED=0
+XUI_SERVICE=""     # discovered at runtime by discover_xui_installation — never hardcoded
 PG_USER=""; PG_PASS=""; PG_HOST=""; PG_PORT=""; PG_DB=""; PG_CONN_NOAUTH=""
 SSH_USE_PASSWORD=0; SSH_PASSWORD=""
 C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_BOLD=""; C_RESET=""
@@ -151,9 +150,16 @@ confirm_yes_no() {
 }
 
 make_workdir() {
-  mkdir -p -m 700 "$WORK_ROOT"
+  # `mkdir -p -m` only applies the mode to directories it actually creates —
+  # a pre-existing WORK_ROOT (e.g. left over from an older version, or
+  # created some other way) would silently keep whatever permissions it
+  # already had. chmod explicitly so a credential-bearing directory is never
+  # left more permissive than 700 regardless of prior state.
+  mkdir -p "$WORK_ROOT"
+  chmod 700 "$WORK_ROOT"
   WORKDIR="${WORK_ROOT}/run-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  mkdir -p -m 700 "$WORKDIR"
+  mkdir -p "$WORKDIR"
+  chmod 700 "$WORKDIR"
 }
 
 cleanup() {
@@ -196,24 +202,66 @@ resolve_xui_env_file() {
   die "$EXIT_ENV_FILE_MISSING" "Could not find x-ui's environment file." "Expected /etc/default/x-ui — is x-ui installed?"
 }
 
-resolve_xui_bin() {
-  local -n _out="$1"
-  local execstart="" path=""
-  execstart=$(systemctl show -p ExecStart "$XUI_SERVICE" 2>/dev/null) || true
-  path=$(printf '%s' "$execstart" | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2-) || true
-  [[ -z "$path" ]] && path="${XUI_MAIN_FOLDER_DEFAULT}/x-ui"
-  if [[ -x "$path" ]]; then
-    _out="$path"
+# discover_xui_installation OUT_SERVICE OUT_BIN — finds x-ui's systemd unit
+# and executable without assuming any fixed unit name or install path.
+# Scans every systemd service unit for one whose name plausibly refers to
+# x-ui/3x-ui, then keeps only the candidates whose ExecStart actually
+# resolves to an existing, executable binary (filters out unrelated units
+# that merely contain "xui" in their name). Dies if no candidate survives;
+# auto-selects if exactly one does; prompts interactively to choose if more
+# than one does. Writes the chosen unit name (without ".service") and the
+# absolute binary path into the two namerefs.
+discover_xui_installation() {
+  local -n _svc_out="$1" _bin_out="$2"
+  local unit_names="" u svc path execstart install_dir version
+  local -a cand_svc=() cand_bin=()
+
+  unit_names=$(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -iE 'x-?ui') || true
+
+  for u in $unit_names; do
+    svc="${u%.service}"
+    execstart=$(systemctl show -p ExecStart "$svc" 2>/dev/null) || true
+    path=$(printf '%s' "$execstart" | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2-) || true
+    [[ -n "$path" && -x "$path" ]] || continue
+    cand_svc+=("$svc")
+    cand_bin+=("$path")
+  done
+
+  if [[ ${#cand_svc[@]} -eq 0 ]]; then
+    die "$EXIT_XUI_NOT_INSTALLED" "No x-ui systemd service with a valid, executable binary was found." "This tool does not install x-ui — install it first, then re-run. Searched every systemd service unit for a name containing 'x-ui'/'xui'."
+  fi
+
+  if [[ ${#cand_svc[@]} -eq 1 ]]; then
+    _svc_out="${cand_svc[0]}"
+    _bin_out="${cand_bin[0]}"
+    install_dir="$(dirname "$_bin_out")"
+    version="$(get_xui_version "$_bin_out")"
+    log_success "Discovered x-ui installation: service '${_svc_out}.service', path $install_dir, binary $_bin_out, version $version"
     return 0
   fi
-  die "$EXIT_XUI_NOT_INSTALLED" "x-ui binary not found or not executable at: $path" "This tool does not install x-ui — install it first, then re-run."
-}
 
-require_xui_installed() {
-  systemctl list-unit-files 2>/dev/null | grep -q "^${XUI_SERVICE}\.service" \
-    || die "$EXIT_XUI_NOT_INSTALLED" "x-ui systemd service not found." "This tool does not install x-ui — install it first, then re-run."
-  local _bin=""
-  resolve_xui_bin _bin
+  print_box "MULTIPLE X-UI-LIKE INSTALLATIONS FOUND" "Select which one this migration should use:"
+  local i
+  for i in "${!cand_svc[@]}"; do
+    version="$(get_xui_version "${cand_bin[$i]}")"
+    printf '  %s%d)%s %s.service  —  %s  (version: %s)\n' "$C_BOLD" "$((i + 1))" "$C_RESET" "${cand_svc[$i]}" "${cand_bin[$i]}" "$version"
+  done
+
+  if [[ ! -t 0 ]]; then
+    die "$EXIT_BAD_ARGS" "Multiple x-ui-like installations found and this session is not interactive." "Re-run interactively (a real terminal, not piped/redirected input) to choose one."
+  fi
+
+  local choice=""
+  while true; do
+    read -r -p "Enter a number (1-${#cand_svc[@]}): " choice || choice=""
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#cand_svc[@]} )); then
+      break
+    fi
+    log_warn "Invalid selection: '$choice'"
+  done
+  _svc_out="${cand_svc[$((choice - 1))]}"
+  _bin_out="${cand_bin[$((choice - 1))]}"
+  log_success "Selected: service '${_svc_out}.service', binary $_bin_out"
 }
 
 detect_backend() {
@@ -302,6 +350,35 @@ resolve_sqlite_path() {
   folder=$(grep -E '^XUI_DB_FOLDER=' "$env_file" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"' \r') || true
   [[ -z "$folder" ]] && folder="$XUI_SQLITE_FOLDER_DEFAULT"
   printf '%s/%s' "$folder" "$XUI_SQLITE_FILENAME"
+}
+
+# sqlite_copy_with_sidecars SRC DEST — copies SRC to DEST, and also copies
+# SRC-wal/SRC-shm to DEST-wal/DEST-shm if they exist. In WAL mode, recently
+# committed rows can still live only in the -wal file, not yet checkpointed
+# into the main .db file; copying just the .db (the old behavior) risked a
+# snapshot that silently missed those rows, or — on restore — risked a
+# stale target -wal being replayed over a freshly restored .db. Copying all
+# three as one matched set (only ever done while x-ui is stopped, so there
+# is no concurrent writer) guarantees the fileset is internally consistent.
+# See AUDIT.md §10.1.
+sqlite_copy_with_sidecars() {
+  local src="$1" dest="$2" side
+  cp -p "$src" "$dest"
+  for side in "-wal" "-shm"; do
+    if [[ -f "${src}${side}" ]]; then
+      cp -p "${src}${side}" "${dest}${side}"
+    fi
+  done
+}
+
+# sqlite_remove_sidecars PATH — removes PATH-wal/PATH-shm if present. Used
+# before placing a freshly restored .db so a stale leftover -wal from the
+# target's previous database can never be replayed over it.
+sqlite_remove_sidecars() {
+  local path="$1" side
+  for side in "-wal" "-shm"; do
+    rm -f "${path}${side}"
+  done
 }
 
 sqlite_sanity_counts() {
@@ -403,6 +480,21 @@ checksum_file() {
   sum=$(sha256sum "$path" | awk '{print $1}')
   (cd "$(dirname "$path")" && sha256sum "$(basename "$path")" > "$(basename "$path").sha256")
   printf '%s' "$sum"
+}
+
+# verify_local_checksum PATH — re-reads PATH from disk and checks it against
+# the .sha256 sidecar checksum_file() just wrote, independently of that
+# write. Catches the archive having been altered/truncated/corrupted
+# between being built and being read back (bad disk, race with another
+# process, etc.) instead of trusting the in-memory value computed a moment
+# earlier. Uses EXIT_CHECKSUM_MISMATCH, which was previously defined but
+# never actually triggered by any code path (AUDIT.md §13).
+verify_local_checksum() {
+  local path="$1" sidecar="${1}.sha256"
+  [[ -f "$sidecar" ]] || die "$EXIT_CHECKSUM_MISMATCH" "Checksum sidecar file not found: $sidecar"
+  if ! (cd "$(dirname "$path")" && sha256sum -c "$(basename "$sidecar")") >/dev/null 2>"$WORKDIR/checksum_verify.stderr"; then
+    die "$EXIT_CHECKSUM_MISMATCH" "Local checksum verification failed for $path." "The archive on disk does not match its own recorded checksum — do not transfer or restore from it. Re-run backup.sh."
+  fi
 }
 
 write_meta_json() {
@@ -579,7 +671,8 @@ main() {
   require_root
   require_supported_os
   require_systemd
-  require_xui_installed
+  local xui_bin=""
+  discover_xui_installation XUI_SERVICE xui_bin
   make_workdir
   trap cleanup EXIT
   trap 'exit 130' INT
@@ -590,8 +683,7 @@ main() {
   local env_file=""; resolve_xui_env_file env_file
   log_info "Environment file: $env_file"
   detect_backend "$env_file" BACKEND
-  local xui_bin="" xui_version
-  resolve_xui_bin xui_bin
+  local xui_version
   xui_version=$(get_xui_version "$xui_bin")
   log_info "Backend: $BACKEND   x-ui version: $xui_version"
   if [[ "$BACKEND" == "postgres" ]]; then
@@ -624,7 +716,7 @@ main() {
     local was_active=1
     xui_is_active && was_active=0
     run_step "stop x-ui for a consistent snapshot" xui_stop_and_wait
-    run_step "copy $SQLITE_PATH" cp -p "$SQLITE_PATH" "$WORKDIR/db/x-ui.db"
+    run_step "copy $SQLITE_PATH (+ WAL/SHM if present)" sqlite_copy_with_sidecars "$SQLITE_PATH" "$WORKDIR/db/x-ui.db"
     if [[ "$DRY_RUN" -eq 0 && $was_active -eq 0 ]]; then
       run_step "restart x-ui" xui_start_and_wait
     fi
@@ -658,8 +750,9 @@ main() {
   run_step "tar czf $archive" build_archive "$archive" "$WORKDIR" "$archive_stem" meta.json db cert etc-default-x-ui.reference
   if [[ "$DRY_RUN" -eq 0 ]]; then
     checksum=$(checksum_file "$archive")
+    verify_local_checksum "$archive"
     local size; size=$(du -h "$archive" 2>/dev/null | cut -f1) || size="?"
-    log_success "Archive built: $archive ($size)"
+    log_success "Archive built and verified: $archive ($size)"
   fi
 
   step_banner 7 8 "Transfer"
