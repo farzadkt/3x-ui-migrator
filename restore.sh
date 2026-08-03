@@ -141,9 +141,16 @@ confirm_typed() {
 }
 
 make_workdir() {
-  mkdir -p -m 700 "$WORK_ROOT"
+  # `mkdir -p -m` only applies the mode to directories it actually creates —
+  # a pre-existing WORK_ROOT (e.g. left over from an older version, or
+  # created some other way) would silently keep whatever permissions it
+  # already had. chmod explicitly so a credential-bearing directory is never
+  # left more permissive than 700 regardless of prior state.
+  mkdir -p "$WORK_ROOT"
+  chmod 700 "$WORK_ROOT"
   WORKDIR="${WORK_ROOT}/run-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  mkdir -p -m 700 "$WORKDIR"
+  mkdir -p "$WORKDIR"
+  chmod 700 "$WORKDIR"
 }
 
 cleanup() {
@@ -342,6 +349,35 @@ resolve_sqlite_path() {
   printf '%s/%s' "$folder" "$XUI_SQLITE_FILENAME"
 }
 
+# sqlite_copy_with_sidecars SRC DEST — copies SRC to DEST, and also copies
+# SRC-wal/SRC-shm to DEST-wal/DEST-shm if they exist. In WAL mode, recently
+# committed rows can still live only in the -wal file, not yet checkpointed
+# into the main .db file; copying just the .db (the old behavior) risked a
+# snapshot that silently missed those rows, or — on restore — risked a
+# stale target -wal being replayed over a freshly restored .db. Copying all
+# three as one matched set (only ever done while x-ui is stopped, so there
+# is no concurrent writer) guarantees the fileset is internally consistent.
+# See AUDIT.md §10.1.
+sqlite_copy_with_sidecars() {
+  local src="$1" dest="$2" side
+  cp -p "$src" "$dest"
+  for side in "-wal" "-shm"; do
+    if [[ -f "${src}${side}" ]]; then
+      cp -p "${src}${side}" "${dest}${side}"
+    fi
+  done
+}
+
+# sqlite_remove_sidecars PATH — removes PATH-wal/PATH-shm if present. Used
+# before placing a freshly restored .db so a stale leftover -wal from the
+# target's previous database can never be replayed over it.
+sqlite_remove_sidecars() {
+  local path="$1" side
+  for side in "-wal" "-shm"; do
+    rm -f "${path}${side}"
+  done
+}
+
 sqlite_integrity_check() {
   local path="$1" result=""
   result=$(sqlite3 "$path" 'PRAGMA integrity_check;' 2>"$WORKDIR/sqlite_check.stderr") || result=""
@@ -412,6 +448,9 @@ extract_archive() {
   local archive="$1" dest_dir="$2"
   local -n _out="$3"
   [[ -f "$archive" ]] || die "$EXIT_ARCHIVE_INVALID" "Archive not found: $archive"
+  if ! tar tzf "$archive" >/dev/null 2>"$WORKDIR/tar_test.stderr"; then
+    die "$EXIT_ARCHIVE_INVALID" "Archive failed integrity check (corrupt or truncated): $archive" "$(cat "$WORKDIR/tar_test.stderr" 2>/dev/null)"
+  fi
   if ! tar xzf "$archive" -C "$dest_dir"; then
     die "$EXIT_ARCHIVE_INVALID" "Failed to extract archive: $archive"
   fi
@@ -421,6 +460,21 @@ extract_archive() {
     die "$EXIT_ARCHIVE_INVALID" "Archive did not contain the expected meta.json." "This may not be a valid xui-mover backup archive."
   fi
   _out="$meta"
+}
+
+# verify_archive_checksum_if_present ARCHIVE — if ARCHIVE.sha256 sits next
+# to the archive (always true after --push-to, since push_archive() ships
+# both files together; true for a manual scp only if the sidecar was copied
+# too), verifies the archive against it and dies with EXIT_CHECKSUM_MISMATCH
+# on a mismatch. If the sidecar isn't present, this is a no-op — the
+# structural check in extract_archive() still runs regardless.
+verify_archive_checksum_if_present() {
+  local archive="$1" sidecar="${1}.sha256"
+  [[ -f "$sidecar" ]] || { log_info "No .sha256 sidecar found next to the archive — skipping checksum verification."; return 0; }
+  if ! (cd "$(dirname "$archive")" && sha256sum -c "$(basename "$sidecar")") >/dev/null 2>"$WORKDIR/checksum_verify.stderr"; then
+    die "$EXIT_CHECKSUM_MISMATCH" "Archive checksum verification failed against $(basename "$sidecar")." "The archive does not match its recorded checksum — do not proceed. Re-transfer it from the source."
+  fi
+  log_success "Archive checksum verified against $(basename "$sidecar")"
 }
 
 read_meta_json_field() {
@@ -549,6 +603,7 @@ main() {
     read -r -p "Path to backup archive (.tar.gz): " ARCHIVE_PATH
   fi
   [[ -f "$ARCHIVE_PATH" ]] || die "$EXIT_ARCHIVE_INVALID" "Archive not found: $ARCHIVE_PATH"
+  verify_archive_checksum_if_present "$ARCHIVE_PATH"
   local meta_json=""; extract_archive "$ARCHIVE_PATH" "$WORKDIR" meta_json
   BUNDLE_DIR=$(dirname "$meta_json")
   local archive_backend source_xui_version
@@ -602,10 +657,21 @@ main() {
       sqlite_existing_perm=$(stat -c '%a' "$SQLITE_PATH" 2>/dev/null) || sqlite_existing_perm=""
       sqlite_existing_owner=$(stat -c '%U:%G' "$SQLITE_PATH" 2>/dev/null) || sqlite_existing_owner=""
     fi
-    run_step "replace $SQLITE_PATH" cp -f "$BUNDLE_DIR/db/x-ui.db" "$SQLITE_PATH"
+    # Remove any stale -wal/-shm left by the target's previous database
+    # before placing the new one — otherwise SQLite would replay the old
+    # WAL over the freshly restored .db on next open (AUDIT.md §10.1).
+    run_step "remove stale WAL/SHM at $SQLITE_PATH" sqlite_remove_sidecars "$SQLITE_PATH"
+    run_step "replace $SQLITE_PATH (+ WAL/SHM if present)" sqlite_copy_with_sidecars "$BUNDLE_DIR/db/x-ui.db" "$SQLITE_PATH"
     if [[ "$DRY_RUN" -eq 0 ]]; then
       chown "${sqlite_existing_owner:-root:root}" "$SQLITE_PATH" 2>/dev/null || true
       chmod "${sqlite_existing_perm:-644}" "$SQLITE_PATH"
+      local sqlite_side
+      for sqlite_side in "-wal" "-shm"; do
+        if [[ -f "${SQLITE_PATH}${sqlite_side}" ]]; then
+          chown "${sqlite_existing_owner:-root:root}" "${SQLITE_PATH}${sqlite_side}" 2>/dev/null || true
+          chmod "${sqlite_existing_perm:-644}" "${SQLITE_PATH}${sqlite_side}"
+        fi
+      done
       if ! sqlite_integrity_check "$SQLITE_PATH"; then
         die "$EXIT_RESTORE_FAILED" "Restored SQLite database failed PRAGMA integrity_check."
       fi

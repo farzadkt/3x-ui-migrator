@@ -150,9 +150,16 @@ confirm_yes_no() {
 }
 
 make_workdir() {
-  mkdir -p -m 700 "$WORK_ROOT"
+  # `mkdir -p -m` only applies the mode to directories it actually creates —
+  # a pre-existing WORK_ROOT (e.g. left over from an older version, or
+  # created some other way) would silently keep whatever permissions it
+  # already had. chmod explicitly so a credential-bearing directory is never
+  # left more permissive than 700 regardless of prior state.
+  mkdir -p "$WORK_ROOT"
+  chmod 700 "$WORK_ROOT"
   WORKDIR="${WORK_ROOT}/run-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  mkdir -p -m 700 "$WORKDIR"
+  mkdir -p "$WORKDIR"
+  chmod 700 "$WORKDIR"
 }
 
 cleanup() {
@@ -345,6 +352,35 @@ resolve_sqlite_path() {
   printf '%s/%s' "$folder" "$XUI_SQLITE_FILENAME"
 }
 
+# sqlite_copy_with_sidecars SRC DEST — copies SRC to DEST, and also copies
+# SRC-wal/SRC-shm to DEST-wal/DEST-shm if they exist. In WAL mode, recently
+# committed rows can still live only in the -wal file, not yet checkpointed
+# into the main .db file; copying just the .db (the old behavior) risked a
+# snapshot that silently missed those rows, or — on restore — risked a
+# stale target -wal being replayed over a freshly restored .db. Copying all
+# three as one matched set (only ever done while x-ui is stopped, so there
+# is no concurrent writer) guarantees the fileset is internally consistent.
+# See AUDIT.md §10.1.
+sqlite_copy_with_sidecars() {
+  local src="$1" dest="$2" side
+  cp -p "$src" "$dest"
+  for side in "-wal" "-shm"; do
+    if [[ -f "${src}${side}" ]]; then
+      cp -p "${src}${side}" "${dest}${side}"
+    fi
+  done
+}
+
+# sqlite_remove_sidecars PATH — removes PATH-wal/PATH-shm if present. Used
+# before placing a freshly restored .db so a stale leftover -wal from the
+# target's previous database can never be replayed over it.
+sqlite_remove_sidecars() {
+  local path="$1" side
+  for side in "-wal" "-shm"; do
+    rm -f "${path}${side}"
+  done
+}
+
 sqlite_sanity_counts() {
   local path="$1"
   local -n _inbounds="$2" _users="$3" _settings="$4"
@@ -444,6 +480,21 @@ checksum_file() {
   sum=$(sha256sum "$path" | awk '{print $1}')
   (cd "$(dirname "$path")" && sha256sum "$(basename "$path")" > "$(basename "$path").sha256")
   printf '%s' "$sum"
+}
+
+# verify_local_checksum PATH — re-reads PATH from disk and checks it against
+# the .sha256 sidecar checksum_file() just wrote, independently of that
+# write. Catches the archive having been altered/truncated/corrupted
+# between being built and being read back (bad disk, race with another
+# process, etc.) instead of trusting the in-memory value computed a moment
+# earlier. Uses EXIT_CHECKSUM_MISMATCH, which was previously defined but
+# never actually triggered by any code path (AUDIT.md §13).
+verify_local_checksum() {
+  local path="$1" sidecar="${1}.sha256"
+  [[ -f "$sidecar" ]] || die "$EXIT_CHECKSUM_MISMATCH" "Checksum sidecar file not found: $sidecar"
+  if ! (cd "$(dirname "$path")" && sha256sum -c "$(basename "$sidecar")") >/dev/null 2>"$WORKDIR/checksum_verify.stderr"; then
+    die "$EXIT_CHECKSUM_MISMATCH" "Local checksum verification failed for $path." "The archive on disk does not match its own recorded checksum — do not transfer or restore from it. Re-run backup.sh."
+  fi
 }
 
 write_meta_json() {
@@ -665,7 +716,7 @@ main() {
     local was_active=1
     xui_is_active && was_active=0
     run_step "stop x-ui for a consistent snapshot" xui_stop_and_wait
-    run_step "copy $SQLITE_PATH" cp -p "$SQLITE_PATH" "$WORKDIR/db/x-ui.db"
+    run_step "copy $SQLITE_PATH (+ WAL/SHM if present)" sqlite_copy_with_sidecars "$SQLITE_PATH" "$WORKDIR/db/x-ui.db"
     if [[ "$DRY_RUN" -eq 0 && $was_active -eq 0 ]]; then
       run_step "restart x-ui" xui_start_and_wait
     fi
@@ -699,8 +750,9 @@ main() {
   run_step "tar czf $archive" build_archive "$archive" "$WORKDIR" "$archive_stem" meta.json db cert etc-default-x-ui.reference
   if [[ "$DRY_RUN" -eq 0 ]]; then
     checksum=$(checksum_file "$archive")
+    verify_local_checksum "$archive"
     local size; size=$(du -h "$archive" 2>/dev/null | cut -f1) || size="?"
-    log_success "Archive built: $archive ($size)"
+    log_success "Archive built and verified: $archive ($size)"
   fi
 
   step_banner 7 8 "Transfer"

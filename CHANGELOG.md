@@ -6,8 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `backup.sh`/`restore.sh`/`lib/common.sh`: SQLite backup and restore now correctly handle the `-wal`/`-shm` WAL-mode sidecar files, not just the main `.db` file. Backup copies all three as one matched set (`sqlite_copy_with_sidecars`) while x-ui is stopped (no concurrent writer), so a snapshot can no longer silently miss rows that were committed to the WAL but not yet checkpointed into the main file. Restore removes any stale `-wal`/`-shm` left by the target's previous database (`sqlite_remove_sidecars`) before placing the new set, so SQLite can no longer replay an old WAL over a freshly restored `.db`. Closes `AUDIT.md` §10.1 (HIGH).
+- `backup.sh`: after building the archive, `verify_local_checksum` re-reads it from disk and checks it against its own just-written `.sha256` sidecar, putting the previously-unused `EXIT_CHECKSUM_MISMATCH` (14) to actual use. Closes the "local checksum verification never implemented" gap noted in `AUDIT.md` §13.
+- `restore.sh`: `extract_archive` now runs `tar tzf` (structural-only check, no extraction) before extracting, so a truncated/corrupted archive fails clearly with `EXIT_ARCHIVE_INVALID` instead of a partial extraction or a confusing downstream error. If a `.sha256` sidecar is present next to the archive (always true after `--push-to`; true for a manual `scp` only if it was copied too), `verify_archive_checksum_if_present` verifies the archive against it before extracting; if absent, this is a silent no-op and only the structural check applies.
+
 ### Changed
 
+- `backup.sh`/`restore.sh`/`lib/common.sh`: `make_workdir` now explicitly `chmod 700`s `WORK_ROOT`/`WORKDIR` instead of relying on `mkdir -p -m 700`, which only applies the requested mode to directories it actually creates — a pre-existing `WORK_ROOT` (e.g. left over from an older version) previously kept whatever permissions it already had, silently defeating the "credential-bearing files stay under a 700 directory" guarantee.
 - `backup.sh`/`restore.sh`/`lib/common.sh`: replaced the hardcoded `XUI_SERVICE="x-ui"` assumption and its `/usr/local/x-ui` fallback path with `discover_xui_installation`, which scans every systemd service unit for one that plausibly refers to x-ui/3x-ui and verifies each candidate's `ExecStart` actually resolves to an existing, executable binary before trusting it. Auto-selects when exactly one valid installation is found; prompts interactively to choose when more than one is found; dies with `EXIT_XUI_NOT_INSTALLED` when none are found. `XUI_MAIN_FOLDER_DEFAULT` is removed as it's no longer needed.
 
 ### Fixed

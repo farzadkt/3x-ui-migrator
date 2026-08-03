@@ -194,10 +194,17 @@ confirm_typed() {
 # ============================================================================
 
 # Creates $WORK_ROOT/run-<ts>-$$ (mode 700) and sets WORKDIR to it.
+# `mkdir -p -m` only applies the mode to directories it actually creates — a
+# pre-existing WORK_ROOT (e.g. left over from an older version, or created
+# some other way) would silently keep whatever permissions it already had.
+# chmod explicitly so a credential-bearing directory is never left more
+# permissive than 700 regardless of prior state.
 make_workdir() {
-  mkdir -p -m 700 "$WORK_ROOT"
+  mkdir -p "$WORK_ROOT"
+  chmod 700 "$WORK_ROOT"
   WORKDIR="${WORK_ROOT}/run-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  mkdir -p -m 700 "$WORKDIR"
+  mkdir -p "$WORKDIR"
+  chmod 700 "$WORKDIR"
 }
 
 # Removes WORKDIR on exit (success or failure). Path-guarded so a bad
@@ -465,6 +472,36 @@ resolve_sqlite_path() {
   printf '%s/%s' "$folder" "$XUI_SQLITE_FILENAME"
 }
 
+# sqlite_copy_with_sidecars SRC DEST — copies SRC to DEST, and also copies
+# SRC-wal/SRC-shm to DEST-wal/DEST-shm if they exist. In WAL mode, recently
+# committed rows can still live only in the -wal file, not yet checkpointed
+# into the main .db file; copying just the .db (the old behavior) risked a
+# snapshot that silently missed those rows, or — on restore — risked a
+# stale target -wal being replayed over a freshly restored .db. Copying all
+# three as one matched set (only ever done while x-ui is stopped, so there
+# is no concurrent writer) guarantees the fileset is internally consistent.
+# See AUDIT.md §10.1. Used by both backup.sh (workdir copy) and restore.sh
+# (bundle -> target copy) — same operation either direction.
+sqlite_copy_with_sidecars() {
+  local src="$1" dest="$2" side
+  cp -p "$src" "$dest"
+  for side in "-wal" "-shm"; do
+    if [[ -f "${src}${side}" ]]; then
+      cp -p "${src}${side}" "${dest}${side}"
+    fi
+  done
+}
+
+# sqlite_remove_sidecars PATH — removes PATH-wal/PATH-shm if present. Used
+# by restore.sh before placing a freshly restored .db so a stale leftover
+# -wal from the target's previous database can never be replayed over it.
+sqlite_remove_sidecars() {
+  local path="$1" side
+  for side in "-wal" "-shm"; do
+    rm -f "${path}${side}"
+  done
+}
+
 sqlite_integrity_check() {
   local path="$1" result=""
   result=$(sqlite3 "$path" 'PRAGMA integrity_check;' 2>"$WORKDIR/sqlite_check.stderr") || result=""
@@ -606,14 +643,52 @@ checksum_file() {
   printf '%s' "$sum"
 }
 
+# verify_local_checksum PATH — re-reads PATH from disk (backup.sh side) and
+# checks it against the .sha256 sidecar checksum_file() just wrote,
+# independently of that write. Catches the archive having been
+# altered/truncated/corrupted between being built and being read back (bad
+# disk, race with another process, etc.) instead of trusting the in-memory
+# value computed a moment earlier. Uses EXIT_CHECKSUM_MISMATCH, which was
+# previously defined but never actually triggered by any code path
+# (AUDIT.md §13).
+verify_local_checksum() {
+  local path="$1" sidecar="${1}.sha256"
+  [[ -f "$sidecar" ]] || die "$EXIT_CHECKSUM_MISMATCH" "Checksum sidecar file not found: $sidecar"
+  if ! (cd "$(dirname "$path")" && sha256sum -c "$(basename "$sidecar")") >/dev/null 2>"$WORKDIR/checksum_verify.stderr"; then
+    die "$EXIT_CHECKSUM_MISMATCH" "Local checksum verification failed for $path." "The archive on disk does not match its own recorded checksum — do not transfer or restore from it. Re-run backup.sh."
+  fi
+}
+
+# verify_archive_checksum_if_present ARCHIVE — restore.sh side counterpart:
+# if ARCHIVE.sha256 sits next to the archive (always true after --push-to,
+# since push_archive() ships both files together; true for a manual scp
+# only if the sidecar was copied too), verifies the archive against it and
+# dies with EXIT_CHECKSUM_MISMATCH on a mismatch. If the sidecar isn't
+# present, this is a no-op — the structural check in extract_archive() below
+# still runs regardless.
+verify_archive_checksum_if_present() {
+  local archive="$1" sidecar="${1}.sha256"
+  [[ -f "$sidecar" ]] || { log_info "No .sha256 sidecar found next to the archive — skipping checksum verification."; return 0; }
+  if ! (cd "$(dirname "$archive")" && sha256sum -c "$(basename "$sidecar")") >/dev/null 2>"$WORKDIR/checksum_verify.stderr"; then
+    die "$EXIT_CHECKSUM_MISMATCH" "Archive checksum verification failed against $(basename "$sidecar")." "The archive does not match its recorded checksum — do not proceed. Re-transfer it from the source."
+  fi
+  log_success "Archive checksum verified against $(basename "$sidecar")"
+}
+
 # extract_archive ARCHIVE DEST_DIR OUT_VAR — extracts and writes the path to
 # the archive's meta.json into OUT_VAR (nameref); dies if missing/corrupt.
 # Caller derives the bundle root via `dirname` of that path. Nameref rather
-# than `$(...)` capture — see resolve_xui_env_file above.
+# than `$(...)` capture — see resolve_xui_env_file above. Runs `tar tzf`
+# first (structural check only, no extraction) so a truncated/corrupted
+# archive is caught with a clear message instead of a partial extraction or
+# a confusing downstream failure.
 extract_archive() {
   local archive="$1" dest_dir="$2"
   local -n _out="$3"
   [[ -f "$archive" ]] || die "$EXIT_ARCHIVE_INVALID" "Archive not found: $archive"
+  if ! tar tzf "$archive" >/dev/null 2>"$WORKDIR/tar_test.stderr"; then
+    die "$EXIT_ARCHIVE_INVALID" "Archive failed integrity check (corrupt or truncated): $archive" "$(cat "$WORKDIR/tar_test.stderr" 2>/dev/null)"
+  fi
   if ! tar xzf "$archive" -C "$dest_dir"; then
     die "$EXIT_ARCHIVE_INVALID" "Failed to extract archive: $archive"
   fi
