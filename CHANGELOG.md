@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `backup.sh`/`restore.sh`/`lib/common.sh`: `resolve_xui_env_file` no longer dies when no environment file is found. x-ui's own systemd unit declares `EnvironmentFile=/etc/default/x-ui` with `ignore_errors=yes` — confirmed against a real install — because that file is only ever created when Postgres is configured through x-ui's own setup menu; a plain SQLite install may never have one at all. Its absence now leaves the env-file variable empty and continues straight to backend auto-detection (`detect_backend`/`resolve_sqlite_path` already default to SQLite when it's missing/unreadable), instead of exiting with `EXIT_ENV_FILE_MISSING`. Reported and reproduced against a live SQLite-only 3x-ui 3.6.0 install.
+
 ### Added
 
 - `backup.sh`/`restore.sh`/`lib/common.sh`: SQLite backup and restore now correctly handle the `-wal`/`-shm` WAL-mode sidecar files, not just the main `.db` file. Backup copies all three as one matched set (`sqlite_copy_with_sidecars`) while x-ui is stopped (no concurrent writer), so a snapshot can no longer silently miss rows that were committed to the WAL but not yet checkpointed into the main file. Restore removes any stale `-wal`/`-shm` left by the target's previous database (`sqlite_remove_sidecars`) before placing the new set, so SQLite can no longer replay an old WAL over a freshly restored `.db`. Closes `AUDIT.md` §10.1 (HIGH).

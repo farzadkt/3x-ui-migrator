@@ -252,6 +252,16 @@ require_systemd() {
 # the generic ERR trap and both the real exit code and message are lost) —
 # see AUDIT.md #1.1. Running in the caller's own shell via nameref avoids
 # that entirely.
+#
+# The env file itself is genuinely optional: x-ui's own systemd unit
+# declares it with `ignore_errors=yes` (verified against a real install),
+# because it only ever gets created when Postgres is configured through
+# x-ui's own setup menu. A plain SQLite install may never have one at all.
+# So its absence is NOT treated as fatal here — OUT_VAR is simply left
+# empty, and detect_backend/resolve_sqlite_path (which already tolerate a
+# missing/unreadable file, defaulting to SQLite) take it from there. Only
+# an actually undetectable backend should ever be fatal, not this file's
+# mere absence.
 resolve_xui_env_file() {
   local -n _out="$1"
   local f
@@ -264,7 +274,7 @@ resolve_xui_env_file() {
     _out="$shown"
     return 0
   fi
-  die "$EXIT_ENV_FILE_MISSING" "Could not find x-ui's environment file." "Expected /etc/default/x-ui — is x-ui installed?"
+  _out=""
 }
 
 # discover_xui_installation OUT_SERVICE OUT_BIN — finds x-ui's systemd unit

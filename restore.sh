@@ -178,6 +178,15 @@ require_systemd() {
   command -v systemctl >/dev/null 2>&1 || die "$EXIT_UNSUPPORTED_OS" "systemd (systemctl) not found." "This tool requires a systemd-based host."
 }
 
+# resolve_xui_env_file OUT_VAR — the env file is genuinely optional: x-ui's
+# own systemd unit declares it with `ignore_errors=yes` (verified against a
+# real install), because it only ever gets created when Postgres is
+# configured through x-ui's own setup menu. A plain SQLite install may never
+# have one at all. So its absence is NOT treated as fatal here — OUT_VAR is
+# simply left empty, and detect_backend/resolve_sqlite_path (which already
+# tolerate a missing/unreadable file, defaulting to SQLite) take it from
+# there. Only an actually undetectable backend should ever be fatal, not
+# this file's mere absence.
 resolve_xui_env_file() {
   local -n _out="$1"
   local f
@@ -190,7 +199,7 @@ resolve_xui_env_file() {
     _out="$shown"
     return 0
   fi
-  die "$EXIT_ENV_FILE_MISSING" "Could not find x-ui's environment file." "Expected /etc/default/x-ui — is x-ui installed?"
+  _out=""
 }
 
 # discover_xui_installation OUT_SERVICE OUT_BIN — finds x-ui's systemd unit
@@ -573,6 +582,11 @@ main() {
 
   step_banner 2 9 "Reading target configuration"
   local env_file=""; resolve_xui_env_file env_file
+  if [[ -n "$env_file" ]]; then
+    log_info "Environment file: $env_file"
+  else
+    log_info "No x-ui environment file found — normal for a SQLite-only install; continuing with backend auto-detection."
+  fi
   detect_backend "$env_file" BACKEND
   local target_xui_version
   target_xui_version=$(get_xui_version "$xui_bin")
