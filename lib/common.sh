@@ -2,7 +2,7 @@
 # lib/common.sh — REFERENCE / DEVELOPMENT COPY ONLY.
 #
 # backup.sh and restore.sh do NOT source this file at runtime. Both must stay
-# runnable via `bash <(curl -fsSL https://raw.githubusercontent.com/alionthecode/xui-mover/main/backup.sh)`
+# runnable via `bash <(curl -fsSL https://raw.githubusercontent.com/farzadkt/3x-ui-migrator/main/backup.sh)`
 # with no other files present, so the functions below are inlined verbatim
 # into both entry-point scripts between the "BEGIN/END shared helpers"
 # markers. If you change a function here, copy the change into both
@@ -34,7 +34,8 @@ readonly XUI_CERT_DIR="/root/cert"
 # keeping credential-bearing files under /root reduces exposure.
 readonly WORK_ROOT="/root/xui-mover"
 readonly REMOTE_INCOMING_DIR_DEFAULT="/root/xui-mover-incoming"
-readonly SERVICE_TIMEOUT_SECS=30
+# Overridable via --service-timeout or XUI_MOVER_SERVICE_TIMEOUT (AUDIT.md §2.5).
+SERVICE_TIMEOUT_SECS="${XUI_MOVER_SERVICE_TIMEOUT:-30}"
 readonly TOOL_VERSION="1.0.0"
 
 # ============================================================================
@@ -68,6 +69,7 @@ readonly EXIT_SANITY_CHECK_FAILED=23        # post-restore count query itself er
 readonly EXIT_SERVICE_START_FAILED=24       # systemctl start x-ui didn't reach active within timeout
 readonly EXIT_CERT_RESTORE_FAILED=25        # cert copy/permission step failed
 readonly EXIT_BAD_ARGS=26                   # invalid flag combination
+readonly EXIT_DISK_FULL=27                  # not enough free space for dump/archive/extract
 
 # ============================================================================
 # Global state (mutated by functions below; each entry-point's main() must
@@ -83,6 +85,9 @@ SERVICE_STOPPED=0              # set to 1 once xui_stop_and_wait() begins; die()
 XUI_SERVICE=""                   # discovered at runtime by discover_xui_installation — never hardcoded
 PG_USER=""; PG_PASS=""; PG_HOST=""; PG_PORT=""; PG_DB=""; PG_CONN_NOAUTH=""
 SSH_USE_PASSWORD=0; SSH_PASSWORD=""
+STDIO_REDIRECTED=0            # set by setup_logging; flush_logs restores stdio so tee/sed drain
+INTERRUPT_RESTART_XUI=0       # backup SQLite snapshot window: restart x-ui on INT/TERM
+PRE_RESTORE_SNAPSHOT=""       # restore.sh safety copy path, kept outside WORKDIR
 
 # ============================================================================
 # Output / logging
@@ -115,9 +120,23 @@ setup_logging() {
     mkdir -p "$WORK_ROOT" 2>/dev/null || true
     LOG_FILE="$WORK_ROOT/xui-mover-${ts}.log"
   fi
+  chmod 600 "$LOG_FILE" 2>/dev/null || true
+  exec 3>&1 4>&2
   exec > >(tee >(sed -u -r 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE")) 2>&1
+  STDIO_REDIRECTED=1
   log_info "Logging to $LOG_FILE"
 }
+
+# Close the tee/sed pipe so the last lines (summary or failure reason) land
+# in $LOG_FILE before the process exits (AUDIT.md §2.4).
+flush_logs() {
+  if [[ "${STDIO_REDIRECTED:-0}" -eq 1 ]]; then
+    exec 1>&3 2>&4
+    exec 3>&- 4>&-
+    STDIO_REDIRECTED=0
+  fi
+}
+
 
 log_info()    { printf '%s[INFO]%s %s\n' "$C_BLUE" "$C_RESET" "$1"; }
 log_warn()    { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$1"; }
@@ -136,7 +155,9 @@ step_banner() {
 print_box() {
   local line max=0
   for line in "$@"; do (( ${#line} > max )) && max=${#line}; done
-  local border; border=$(printf -- '-%.0s' $(seq 1 $((max + 2))))
+  local border
+  # shellcheck disable=SC2046
+  border=$(printf -- '-%.0s' $(seq 1 $((max + 2))))
   printf '%s+%s+%s\n' "$C_BOLD" "$border" "$C_RESET"
   for line in "$@"; do
     printf '%s|%s %-*s %s|%s\n' "$C_BOLD" "$C_RESET" "$max" "$line" "$C_BOLD" "$C_RESET"
@@ -163,6 +184,7 @@ die() {
       tail_xui_log 20
     fi
   } >&2
+  flush_logs
   exit "$code"
 }
 
@@ -212,6 +234,7 @@ make_workdir() {
 # `trap cleanup EXIT` — does not call exit itself, so the script's real exit
 # status is preserved.
 cleanup() {
+  flush_logs
   if [[ -n "${WORKDIR:-}" && "$WORKDIR" == "$WORK_ROOT"/run-* && -d "$WORKDIR" ]]; then
     # `|| true`: this runs as the EXIT trap under `set -e` — an rm failure
     # here (busy mount, odd permissions) must never override the script's
@@ -241,6 +264,29 @@ require_supported_os() {
 
 require_systemd() {
   command -v systemctl >/dev/null 2>&1 || die "$EXIT_UNSUPPORTED_OS" "systemd (systemctl) not found." "This tool requires a systemd-based host."
+}
+
+require_free_space() {
+  local dir="$1" min_kb="${2:-262144}"
+  mkdir -p "$dir" 2>/dev/null || true
+  local avail=""
+  avail=$(df -Pk "$dir" 2>/dev/null | awk 'NR==2 {print $4}') || avail=""
+  [[ "$avail" =~ ^[0-9]+$ ]] || return 0
+  if (( avail < min_kb )); then
+    die "$EXIT_DISK_FULL" "Not enough free space in $dir (${avail} KB available, need at least ${min_kb} KB)." "Free some disk space and re-run."
+  fi
+}
+
+handle_interrupt() {
+  local code="$1"
+  if [[ "${INTERRUPT_RESTART_XUI:-0}" -eq 1 && -n "${XUI_SERVICE:-}" ]]; then
+    log_warn "Interrupted — restarting x-ui so the panel is not left down."
+    systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || log_error "Could not restart x-ui after interrupt. Start it manually: systemctl start ${XUI_SERVICE}"
+  elif [[ -n "${PRE_RESTORE_SNAPSHOT:-}" ]]; then
+    log_warn "Interrupted during restore. Pre-restore snapshot kept at $PRE_RESTORE_SNAPSHOT. x-ui left stopped."
+  fi
+  flush_logs
+  exit "$code"
 }
 
 # Finds x-ui's environment file: checks the known candidate paths first,
@@ -367,27 +413,56 @@ get_xui_version() {
 # Postgres
 # ============================================================================
 
+# Percent-decode a URL component. Does NOT treat `+` as space — that rule
+# belongs to application/x-www-form-urlencoded query strings, not the
+# userinfo (user:password) component of a URI (AUDIT.md §1.3). Only valid
+# `%HH` sequences are decoded; a stray `%` or a literal backslash is left
+# untouched, so printf `%b` cannot mis-interpret password bytes (AUDIT.md §1.4).
 url_decode() {
-  local data="${1//+/ }"
-  printf '%b' "${data//%/\\x}"
+  local data="$1" out="" i=0 c hex
+  local len=${#data}
+  while (( i < len )); do
+    c="${data:i:1}"
+    if [[ "$c" == "%" ]]; then
+      hex="${data:i+1:2}"
+      if [[ "$hex" =~ ^[0-9A-Fa-f]{2}$ ]]; then
+        printf -v c '%b' "\\x${hex}"
+        out+="$c"
+        i=$((i + 3))
+        continue
+      fi
+    fi
+    out+="$c"
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
 }
 
 # parse_pg_dsn DSN — populates PG_USER/PG_PASS/PG_HOST/PG_PORT/PG_DB and
 # PG_CONN_NOAUTH (a credential-free connection URI reconstructed from the
 # original, preserving arbitrary query params like sslmode instead of
-# assuming one). Dies on an unparseable DSN.
+# assuming one). Accepts the forms x-ui actually writes and the common
+# shortenings operators type by hand: optional password, optional port
+# (defaults to 5432), IPv6 hosts in brackets (AUDIT.md §11.2). Dies on an
+# unparseable DSN. Password is percent-decoded via url_decode.
 parse_pg_dsn() {
   local dsn="$1"
-  if [[ "$dsn" =~ ^postgres(ql)?://([^:@/]+):([^@]*)@([^:/]+):([0-9]+)/([^?]+)(\?(.*))?$ ]]; then
+  if [[ "$dsn" =~ ^postgres(ql)?://([^:/@]+)(:([^@]*))?@(\[[^]]+\]|[^:/]+)(:([0-9]+))?/([^?]+)(\?(.*))?$ ]]; then
     PG_USER="${BASH_REMATCH[2]}"
-    PG_PASS="$(url_decode "${BASH_REMATCH[3]}")"
-    PG_HOST="${BASH_REMATCH[4]}"
-    PG_PORT="${BASH_REMATCH[5]}"
-    PG_DB="${BASH_REMATCH[6]}"
-    local query="${BASH_REMATCH[8]}"
+    if [[ -n "${BASH_REMATCH[3]}" ]]; then
+      PG_PASS="$(url_decode "${BASH_REMATCH[4]}")"
+    else
+      PG_PASS=""
+    fi
+    PG_HOST="${BASH_REMATCH[5]}"
+    PG_HOST="${PG_HOST#[}"
+    PG_HOST="${PG_HOST%]}"
+    PG_PORT="${BASH_REMATCH[7]:-5432}"
+    PG_DB="${BASH_REMATCH[8]}"
+    local query="${BASH_REMATCH[10]}"
     PG_CONN_NOAUTH="postgres://${PG_HOST}:${PG_PORT}/${PG_DB}${query:+?$query}"
   else
-    die "$EXIT_DSN_PARSE_FAILED" "Could not parse XUI_DB_DSN." "Expected format: postgres://user:pass@host:port/dbname?sslmode=disable"
+    die "$EXIT_DSN_PARSE_FAILED" "Could not parse XUI_DB_DSN." "Expected format: postgres://user[:pass]@host[:port]/dbname[?sslmode=disable] — password and port are optional (port defaults to 5432)."
   fi
 }
 
@@ -426,7 +501,7 @@ pg_dump_to_file() {
 # --if-exists NOTICE lines during a first restore.
 pg_restore_from_file() {
   local dump_file="$1" rc=0
-  PGPASSWORD="$PG_PASS" pg_restore --no-owner --role="$PG_USER" -c --if-exists \
+  PGPASSWORD="$PG_PASS" pg_restore --no-owner --role="$PG_USER" -c --if-exists --single-transaction \
     -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" "$dump_file" \
     >"$WORKDIR/pg_restore.out" 2>&1 || rc=$?
   if grep -qE '^pg_restore: error:' "$WORKDIR/pg_restore.out" 2>/dev/null; then
@@ -597,17 +672,36 @@ tail_xui_log() {
 # ============================================================================
 
 # count_nodes_rows — relies on the caller having set BACKEND and (for
-# sqlite) SQLITE_PATH globals. Treats a missing 'nodes' table as 0 rather
-# than an error (older/never-multi-node installs may not have the table).
+# sqlite) SQLITE_PATH globals. A missing 'nodes' table is treated as 0
+# (older/never-multi-node installs). Any other query error is fatal: failing
+# open (coercing errors to 0) would silently skip the multi-node guard
+# (AUDIT.md §2.3).
 count_nodes_rows() {
-  local n=""
+  local n="" err=""
   if [[ "$BACKEND" == "postgres" ]]; then
-    n=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc 'SELECT count(*) FROM nodes;' 2>/dev/null) || n="0"
+    n=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc 'SELECT count(*) FROM nodes;' 2>"$WORKDIR/nodes.stderr") || {
+      err=$(cat "$WORKDIR/nodes.stderr" 2>/dev/null || true)
+      if [[ "$err" == *"does not exist"* ]]; then
+        printf '0'
+        return 0
+      fi
+      die "$EXIT_SANITY_CHECK_FAILED" "Could not determine node count (refusing to skip the multi-node guard)." "$err"
+    }
   else
-    n=$(sqlite3 "$SQLITE_PATH" 'SELECT count(*) FROM nodes;' 2>/dev/null) || n="0"
+    n=$(sqlite3 "$SQLITE_PATH" 'SELECT count(*) FROM nodes;' 2>"$WORKDIR/nodes.stderr") || {
+      err=$(cat "$WORKDIR/nodes.stderr" 2>/dev/null || true)
+      if [[ "$err" == *"no such table"* ]]; then
+        printf '0'
+        return 0
+      fi
+      die "$EXIT_SANITY_CHECK_FAILED" "Could not determine node count (refusing to skip the multi-node guard)." "$err"
+    }
   fi
   n="${n//[[:space:]]/}"
   [[ -z "$n" ]] && n="0"
+  if [[ ! "$n" =~ ^[0-9]+$ ]]; then
+    die "$EXIT_SANITY_CHECK_FAILED" "Node count query returned a non-numeric value." "Got: ${n:0:80}"
+  fi
   printf '%s' "$n"
 }
 
@@ -710,11 +804,24 @@ extract_archive() {
   _out="$meta"
 }
 
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
 # Hand-rolled flat JSON writer/reader — deliberately no jq dependency, since
 # we fully control meta.json's format (single-level, plus one nested object)
-# and the PRD never requires jq.
+# and the PRD never requires jq. String fields are escaped (AUDIT.md §1.8).
 write_meta_json() {
   local out_file="$1" hostname_v="$2" backend_v="$3" xui_version_v="$4" inbounds_v="$5" users_v="$6" settings_v="$7" nodes_v="$8"
+  hostname_v="$(json_escape "$hostname_v")"
+  backend_v="$(json_escape "$backend_v")"
+  xui_version_v="$(json_escape "$xui_version_v")"
   cat > "$out_file" <<EOF
 {
   "tool_version": "${TOOL_VERSION}",
@@ -795,10 +902,13 @@ push_archive() {
   local local_sum=""; local_sum=$(sha256sum "$local_tar" | awk '{print $1}')
 
   rc=0
+  local remote_dir_q tar_q
+  printf -v remote_dir_q '%q' "$remote_dir"
+  printf -v tar_q '%q' "${remote_dir}/$(basename "$local_tar")"
   if [[ "$SSH_USE_PASSWORD" -eq 1 ]]; then
-    SSHPASS="$SSH_PASSWORD" sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no "${opts[@]}" "$user_host" "mkdir -p '$remote_dir'" || rc=$?
+    SSHPASS="$SSH_PASSWORD" sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no "${opts[@]}" "$user_host" "mkdir -p ${remote_dir_q}" || rc=$?
   else
-    ssh "${opts[@]}" "$user_host" "mkdir -p '$remote_dir'" || rc=$?
+    ssh "${opts[@]}" "$user_host" "mkdir -p ${remote_dir_q}" || rc=$?
   fi
   [[ $rc -ne 0 ]] && die "$EXIT_PUSH_VERIFY_FAILED" "Failed to create remote directory $remote_dir on $user_host."
 
@@ -815,15 +925,139 @@ push_archive() {
 
   local remote_sum=""
   if [[ "$SSH_USE_PASSWORD" -eq 1 ]]; then
-    remote_sum=$(SSHPASS="$SSH_PASSWORD" sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no "${opts[@]}" "$user_host" "sha256sum '${remote_dir}/$(basename "$local_tar")'" 2>/dev/null | awk '{print $1}') || remote_sum=""
+    remote_sum=$(SSHPASS="$SSH_PASSWORD" sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no "${opts[@]}" "$user_host" "sha256sum ${tar_q}" 2>/dev/null | awk '{print $1}') || remote_sum=""
   else
-    remote_sum=$(ssh "${opts[@]}" "$user_host" "sha256sum '${remote_dir}/$(basename "$local_tar")'" 2>/dev/null | awk '{print $1}') || remote_sum=""
+    remote_sum=$(ssh "${opts[@]}" "$user_host" "sha256sum ${tar_q}" 2>/dev/null | awk '{print $1}') || remote_sum=""
   fi
 
   if [[ -z "$remote_sum" || "$remote_sum" != "$local_sum" ]]; then
     die "$EXIT_PUSH_VERIFY_FAILED" "Remote checksum did not match local checksum after transfer." "Local: $local_sum  Remote: ${remote_sum:-<missing>}"
   fi
   REMOTE_ARCHIVE_PATH="${remote_dir}/$(basename "$local_tar")"
+}
+
+# ============================================================================
+# Certs
+# ============================================================================
+
+list_cert_paths_from_db() {
+  local sql="SELECT value FROM settings WHERE key IN ('webCertFile','webKeyFile');"
+  local raw="" blob=""
+  if [[ "${BACKEND:-}" == "postgres" ]]; then
+    raw=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc "$sql" 2>/dev/null) || raw=""
+    blob=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc 'SELECT settings FROM inbounds;' 2>/dev/null) || blob=""
+  elif [[ -n "${SQLITE_PATH:-}" && -f "$SQLITE_PATH" ]]; then
+    raw=$(sqlite3 "$SQLITE_PATH" "$sql" 2>/dev/null) || raw=""
+    blob=$(sqlite3 "$SQLITE_PATH" 'SELECT settings FROM inbounds;' 2>/dev/null) || blob=""
+  fi
+  printf '%s\n' "$raw"
+  printf '%s' "$blob" | grep -oE '/[^[:space:]\"'\'']+\.(pem|crt|key|cer|cert)' || true
+}
+
+collect_panel_certs() {
+  local dest="$1" copied=0 path rel
+  mkdir -p "$dest/cert"
+  if [[ -d "$XUI_CERT_DIR" ]]; then
+    cp -a "$XUI_CERT_DIR/." "$dest/cert/"
+  fi
+  mkdir -p "$dest/extra-certs"
+  if [[ -d /root/.acme.sh ]]; then
+    cp -a /root/.acme.sh "$dest/extra-certs/acme.sh"
+    copied=1
+    log_info "Captured /root/.acme.sh"
+  fi
+  if [[ -d /etc/letsencrypt ]]; then
+    cp -a /etc/letsencrypt "$dest/extra-certs/letsencrypt"
+    copied=1
+    log_info "Captured /etc/letsencrypt"
+  fi
+  : >"$dest/extra-certs/paths.list"
+  while IFS= read -r path; do
+    [[ -z "$path" || ! -e "$path" ]] && continue
+    case "$path" in
+      "$XUI_CERT_DIR"/*|/root/.acme.sh/*|/etc/letsencrypt/*) continue ;;
+    esac
+    rel="files${path}"
+    mkdir -p "$dest/extra-certs/$(dirname "$rel")"
+    cp -a "$path" "$dest/extra-certs/$rel"
+    printf '%s\n' "$path" >> "$dest/extra-certs/paths.list"
+    copied=1
+    log_info "Captured extra cert path: $path"
+  done < <(list_cert_paths_from_db)
+  if [[ "$copied" -eq 0 ]]; then
+    rm -rf "$dest/extra-certs"
+  fi
+}
+
+restore_panel_certs() {
+  local bundle="$1" path src
+  if [[ -d "$bundle/cert" && -n "$(ls -A "$bundle/cert" 2>/dev/null)" ]]; then
+    mkdir -p "$XUI_CERT_DIR"
+    find "$XUI_CERT_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+    cp -a "$bundle/cert/." "$XUI_CERT_DIR/" || die "$EXIT_CERT_RESTORE_FAILED" "Failed to copy certs into $XUI_CERT_DIR."
+    log_success "Certs restored to $XUI_CERT_DIR (replaced, not merged)."
+  else
+    log_warn "Archive contains no certs under cert/ — skipping $XUI_CERT_DIR restore."
+  fi
+  if [[ -d "$bundle/extra-certs/acme.sh" ]]; then
+    rm -rf /root/.acme.sh
+    cp -a "$bundle/extra-certs/acme.sh" /root/.acme.sh || die "$EXIT_CERT_RESTORE_FAILED" "Failed to restore /root/.acme.sh."
+    chmod -R go-rwx /root/.acme.sh 2>/dev/null || true
+    log_success "Restored /root/.acme.sh"
+  fi
+  if [[ -d "$bundle/extra-certs/letsencrypt" ]]; then
+    rm -rf /etc/letsencrypt
+    cp -a "$bundle/extra-certs/letsencrypt" /etc/letsencrypt || die "$EXIT_CERT_RESTORE_FAILED" "Failed to restore /etc/letsencrypt."
+    log_success "Restored /etc/letsencrypt"
+  fi
+  if [[ -f "$bundle/extra-certs/paths.list" ]]; then
+    while IFS= read -r path; do
+      [[ -z "$path" ]] && continue
+      src="$bundle/extra-certs/files${path}"
+      [[ -e "$src" ]] || continue
+      mkdir -p "$(dirname "$path")"
+      cp -a "$src" "$path" || die "$EXIT_CERT_RESTORE_FAILED" "Failed to restore cert file $path."
+    done < "$bundle/extra-certs/paths.list"
+  fi
+}
+
+harden_cert_permissions() {
+  local dir="$1" f
+  [[ -d "$dir" ]] || return 0
+  while IFS= read -r -d '' f; do
+    if command -v openssl >/dev/null 2>&1 && openssl pkey -in "$f" -noout >/dev/null 2>&1; then
+      chmod 600 "$f"
+    elif command -v openssl >/dev/null 2>&1 && openssl x509 -in "$f" -noout >/dev/null 2>&1; then
+      chmod 644 "$f"
+    else
+      case "${f##*/}" in
+        *key*|*KEY*) chmod 600 "$f" ;;
+        *.pem|*.crt|*.cer) chmod 644 "$f" ;;
+      esac
+    fi
+  done < <(find "$dir" -type f -print0 2>/dev/null)
+}
+
+take_pre_restore_snapshot() {
+  local snap="${WORK_ROOT}/pre-restore-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$snap"
+  chmod 700 "$snap"
+  if [[ "$BACKEND" == "postgres" ]]; then
+    if ! PGPASSWORD="$PG_PASS" pg_dump -Fc -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -f "$snap/x-ui.dump" 2>"$WORKDIR/pre_restore_dump.stderr"; then
+      log_warn "Could not take a Postgres pre-restore snapshot (continuing anyway): $(tr '\n' ' ' <"$WORKDIR/pre_restore_dump.stderr" 2>/dev/null)"
+      rm -rf "$snap"
+      return 0
+    fi
+  else
+    if [[ -f "$SQLITE_PATH" ]]; then
+      sqlite_copy_with_sidecars "$SQLITE_PATH" "$snap/x-ui.db"
+    fi
+  fi
+  if [[ -d "$XUI_CERT_DIR" ]]; then
+    cp -a "$XUI_CERT_DIR" "$snap/cert" 2>/dev/null || true
+  fi
+  PRE_RESTORE_SNAPSHOT="$snap"
+  log_info "Pre-restore safety snapshot saved at $snap (kept if restore is interrupted or fails)."
 }
 
 # ============================================================================

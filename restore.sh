@@ -8,7 +8,7 @@
 # destructive happens.
 #
 # Usage:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/alionthecode/xui-mover/main/restore.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/farzadkt/3x-ui-migrator/main/restore.sh)
 #   restore.sh --archive /root/xui-mover-incoming/xui-backup-old-20260715T180400Z.tar.gz
 #
 # Run `restore.sh --help` for the full flag list. Must be run as root on a
@@ -34,7 +34,7 @@ readonly XUI_SQLITE_FOLDER_DEFAULT="/etc/x-ui"
 readonly XUI_SQLITE_FILENAME="x-ui.db"
 readonly XUI_CERT_DIR="/root/cert"
 readonly WORK_ROOT="/root/xui-mover"
-readonly SERVICE_TIMEOUT_SECS=30
+SERVICE_TIMEOUT_SECS="${XUI_MOVER_SERVICE_TIMEOUT:-30}"
 
 readonly EXIT_GENERIC=1
 readonly EXIT_NOT_ROOT=2
@@ -62,15 +62,23 @@ readonly EXIT_SANITY_CHECK_FAILED=23
 readonly EXIT_SERVICE_START_FAILED=24
 readonly EXIT_CERT_RESTORE_FAILED=25
 readonly EXIT_BAD_ARGS=26
+readonly EXIT_DISK_FULL=27
 
 DRY_RUN=0
 NO_COLOR_FLAG=0
 ASSUME_YES=0
+# auto = ask interactively when stale inbounds are found; yes/no = decided by flag
+REBIND_LISTEN="auto"
+LISTEN_ADDRESS_OVERRIDE=""
+XRAY_UNHEALTHY=0
 WORKDIR=""
 LOG_FILE=""
 SERVICE_STOPPED=0
 XUI_SERVICE=""     # discovered at runtime by discover_xui_installation — never hardcoded
 PG_USER=""; PG_PASS=""; PG_HOST=""; PG_PORT=""; PG_DB=""; PG_CONN_NOAUTH=""
+STDIO_REDIRECTED=0
+INTERRUPT_RESTART_XUI=0
+PRE_RESTORE_SNAPSHOT=""
 C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_BOLD=""; C_RESET=""
 
 ui_supports_color() {
@@ -92,9 +100,21 @@ setup_logging() {
     mkdir -p "$WORK_ROOT" 2>/dev/null || true
     LOG_FILE="$WORK_ROOT/xui-mover-${ts}.log"
   fi
+  chmod 600 "$LOG_FILE" 2>/dev/null || true
+  exec 3>&1 4>&2
   exec > >(tee >(sed -u -r 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE")) 2>&1
+  STDIO_REDIRECTED=1
   log_info "Logging to $LOG_FILE"
 }
+
+flush_logs() {
+  if [[ "${STDIO_REDIRECTED:-0}" -eq 1 ]]; then
+    exec 1>&3 2>&4
+    exec 3>&- 4>&-
+    STDIO_REDIRECTED=0
+  fi
+}
+
 
 log_info()    { printf '%s[INFO]%s %s\n' "$C_BLUE" "$C_RESET" "$1"; }
 log_warn()    { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$1"; }
@@ -108,7 +128,9 @@ step_banner() {
 print_box() {
   local line max=0
   for line in "$@"; do (( ${#line} > max )) && max=${#line}; done
-  local border; border=$(printf -- '-%.0s' $(seq 1 $((max + 2))))
+  local border
+  # shellcheck disable=SC2046
+  border=$(printf -- '-%.0s' $(seq 1 $((max + 2))))
   printf '%s+%s+%s\n' "$C_BOLD" "$border" "$C_RESET"
   for line in "$@"; do
     printf '%s|%s %-*s %s|%s\n' "$C_BOLD" "$C_RESET" "$max" "$line" "$C_BOLD" "$C_RESET"
@@ -131,6 +153,7 @@ die() {
       tail_xui_log 20
     fi
   } >&2
+  flush_logs
   exit "$code"
 }
 
@@ -154,6 +177,7 @@ make_workdir() {
 }
 
 cleanup() {
+  flush_logs
   if [[ -n "${WORKDIR:-}" && "$WORKDIR" == "$WORK_ROOT"/run-* && -d "$WORKDIR" ]]; then
     rm -rf "$WORKDIR" || true
   fi
@@ -176,6 +200,29 @@ require_supported_os() {
 
 require_systemd() {
   command -v systemctl >/dev/null 2>&1 || die "$EXIT_UNSUPPORTED_OS" "systemd (systemctl) not found." "This tool requires a systemd-based host."
+}
+
+require_free_space() {
+  local dir="$1" min_kb="${2:-262144}"
+  mkdir -p "$dir" 2>/dev/null || true
+  local avail=""
+  avail=$(df -Pk "$dir" 2>/dev/null | awk 'NR==2 {print $4}') || avail=""
+  [[ "$avail" =~ ^[0-9]+$ ]] || return 0
+  if (( avail < min_kb )); then
+    die "$EXIT_DISK_FULL" "Not enough free space in $dir (${avail} KB available, need at least ${min_kb} KB)." "Free some disk space and re-run."
+  fi
+}
+
+handle_interrupt() {
+  local code="$1"
+  if [[ "${INTERRUPT_RESTART_XUI:-0}" -eq 1 && -n "${XUI_SERVICE:-}" ]]; then
+    log_warn "Interrupted — restarting x-ui so the panel is not left down."
+    systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || log_error "Could not restart x-ui after interrupt. Start it manually: systemctl start ${XUI_SERVICE}"
+  elif [[ -n "${PRE_RESTORE_SNAPSHOT:-}" ]]; then
+    log_warn "Interrupted during restore. Pre-restore snapshot kept at $PRE_RESTORE_SNAPSHOT. x-ui left stopped."
+  fi
+  flush_logs
+  exit "$code"
 }
 
 # resolve_xui_env_file OUT_VAR — the env file is genuinely optional: x-ui's
@@ -284,22 +331,43 @@ get_xui_version() {
 }
 
 url_decode() {
-  local data="${1//+/ }"
-  printf '%b' "${data//%/\\x}"
+  local data="$1" out="" i=0 c hex
+  local len=${#data}
+  while (( i < len )); do
+    c="${data:i:1}"
+    if [[ "$c" == "%" ]]; then
+      hex="${data:i+1:2}"
+      if [[ "$hex" =~ ^[0-9A-Fa-f]{2}$ ]]; then
+        printf -v c '%b' "\\x${hex}"
+        out+="$c"
+        i=$((i + 3))
+        continue
+      fi
+    fi
+    out+="$c"
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
 }
 
 parse_pg_dsn() {
   local dsn="$1"
-  if [[ "$dsn" =~ ^postgres(ql)?://([^:@/]+):([^@]*)@([^:/]+):([0-9]+)/([^?]+)(\?(.*))?$ ]]; then
+  if [[ "$dsn" =~ ^postgres(ql)?://([^:/@]+)(:([^@]*))?@(\[[^]]+\]|[^:/]+)(:([0-9]+))?/([^?]+)(\?(.*))?$ ]]; then
     PG_USER="${BASH_REMATCH[2]}"
-    PG_PASS="$(url_decode "${BASH_REMATCH[3]}")"
-    PG_HOST="${BASH_REMATCH[4]}"
-    PG_PORT="${BASH_REMATCH[5]}"
-    PG_DB="${BASH_REMATCH[6]}"
-    local query="${BASH_REMATCH[8]}"
+    if [[ -n "${BASH_REMATCH[3]}" ]]; then
+      PG_PASS="$(url_decode "${BASH_REMATCH[4]}")"
+    else
+      PG_PASS=""
+    fi
+    PG_HOST="${BASH_REMATCH[5]}"
+    PG_HOST="${PG_HOST#[}"
+    PG_HOST="${PG_HOST%]}"
+    PG_PORT="${BASH_REMATCH[7]:-5432}"
+    PG_DB="${BASH_REMATCH[8]}"
+    local query="${BASH_REMATCH[10]}"
     PG_CONN_NOAUTH="postgres://${PG_HOST}:${PG_PORT}/${PG_DB}${query:+?$query}"
   else
-    die "$EXIT_DSN_PARSE_FAILED" "Could not parse XUI_DB_DSN." "Expected format: postgres://user:pass@host:port/dbname?sslmode=disable"
+    die "$EXIT_DSN_PARSE_FAILED" "Could not parse XUI_DB_DSN." "Expected format: postgres://user[:pass]@host[:port]/dbname[?sslmode=disable] — password and port are optional (port defaults to 5432)."
   fi
 }
 
@@ -319,7 +387,7 @@ pg_test_connection() {
 
 pg_restore_from_file() {
   local dump_file="$1" rc=0
-  PGPASSWORD="$PG_PASS" pg_restore --no-owner --role="$PG_USER" -c --if-exists \
+  PGPASSWORD="$PG_PASS" pg_restore --no-owner --role="$PG_USER" -c --if-exists --single-transaction \
     -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" "$dump_file" \
     >"$WORKDIR/pg_restore.out" 2>&1 || rc=$?
   if grep -qE '^pg_restore: error:' "$WORKDIR/pg_restore.out" 2>/dev/null; then
@@ -496,6 +564,77 @@ read_meta_json_number() {
   grep -oE "\"${key}\"[[:space:]]*:[[:space:]]*[0-9]+" "$file" 2>/dev/null | head -1 | sed -E 's/.*:[[:space:]]*//'
 }
 
+restore_panel_certs() {
+  local bundle="$1" path src
+  if [[ -d "$bundle/cert" && -n "$(ls -A "$bundle/cert" 2>/dev/null)" ]]; then
+    mkdir -p "$XUI_CERT_DIR"
+    find "$XUI_CERT_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+    cp -a "$bundle/cert/." "$XUI_CERT_DIR/" || die "$EXIT_CERT_RESTORE_FAILED" "Failed to copy certs into $XUI_CERT_DIR."
+    log_success "Certs restored to $XUI_CERT_DIR (replaced, not merged)."
+  else
+    log_warn "Archive contains no certs under cert/ — skipping $XUI_CERT_DIR restore."
+  fi
+  if [[ -d "$bundle/extra-certs/acme.sh" ]]; then
+    rm -rf /root/.acme.sh
+    cp -a "$bundle/extra-certs/acme.sh" /root/.acme.sh || die "$EXIT_CERT_RESTORE_FAILED" "Failed to restore /root/.acme.sh."
+    chmod -R go-rwx /root/.acme.sh 2>/dev/null || true
+    log_success "Restored /root/.acme.sh"
+  fi
+  if [[ -d "$bundle/extra-certs/letsencrypt" ]]; then
+    rm -rf /etc/letsencrypt
+    cp -a "$bundle/extra-certs/letsencrypt" /etc/letsencrypt || die "$EXIT_CERT_RESTORE_FAILED" "Failed to restore /etc/letsencrypt."
+    log_success "Restored /etc/letsencrypt"
+  fi
+  if [[ -f "$bundle/extra-certs/paths.list" ]]; then
+    while IFS= read -r path; do
+      [[ -z "$path" ]] && continue
+      src="$bundle/extra-certs/files${path}"
+      [[ -e "$src" ]] || continue
+      mkdir -p "$(dirname "$path")"
+      cp -a "$src" "$path" || die "$EXIT_CERT_RESTORE_FAILED" "Failed to restore cert file $path."
+    done < "$bundle/extra-certs/paths.list"
+  fi
+}
+
+harden_cert_permissions() {
+  local dir="$1" f
+  [[ -d "$dir" ]] || return 0
+  while IFS= read -r -d '' f; do
+    if command -v openssl >/dev/null 2>&1 && openssl pkey -in "$f" -noout >/dev/null 2>&1; then
+      chmod 600 "$f"
+    elif command -v openssl >/dev/null 2>&1 && openssl x509 -in "$f" -noout >/dev/null 2>&1; then
+      chmod 644 "$f"
+    else
+      case "${f##*/}" in
+        *key*|*KEY*) chmod 600 "$f" ;;
+        *.pem|*.crt|*.cer) chmod 644 "$f" ;;
+      esac
+    fi
+  done < <(find "$dir" -type f -print0 2>/dev/null)
+}
+
+take_pre_restore_snapshot() {
+  local snap="${WORK_ROOT}/pre-restore-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$snap"
+  chmod 700 "$snap"
+  if [[ "$BACKEND" == "postgres" ]]; then
+    if ! PGPASSWORD="$PG_PASS" pg_dump -Fc -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -f "$snap/x-ui.dump" 2>"$WORKDIR/pre_restore_dump.stderr"; then
+      log_warn "Could not take a Postgres pre-restore snapshot (continuing anyway): $(tr '\n' ' ' <"$WORKDIR/pre_restore_dump.stderr" 2>/dev/null)"
+      rm -rf "$snap"
+      return 0
+    fi
+  else
+    if [[ -f "$SQLITE_PATH" ]]; then
+      sqlite_copy_with_sidecars "$SQLITE_PATH" "$snap/x-ui.db"
+    fi
+  fi
+  if [[ -d "$XUI_CERT_DIR" ]]; then
+    cp -a "$XUI_CERT_DIR" "$snap/cert" 2>/dev/null || true
+  fi
+  PRE_RESTORE_SNAPSHOT="$snap"
+  log_info "Pre-restore safety snapshot saved at $snap (kept if restore is interrupted or fails)."
+}
+
 run_step() {
   local desc="$1"; shift
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -507,6 +646,162 @@ run_step() {
 
 # ============================================================================
 # END shared helpers
+
+# local_ip_literals — every IP address actually assigned to an interface on
+# this host, one per line, plus the wildcard/loopback forms that are always
+# bindable. Used to decide whether a restored inbound's `listen` value can
+# still be bound here.
+local_ip_literals() {
+  {
+    printf '0.0.0.0\n::\n127.0.0.1\n::1\n'
+    if command -v ip >/dev/null 2>&1; then
+      ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+    elif command -v hostname >/dev/null 2>&1; then
+      hostname -I 2>/dev/null | tr ' ' '\n'
+    fi
+  } | sed '/^$/d'
+}
+
+# primary_local_ip — this server's own primary IPv4: the source address the
+# kernel would use for outbound traffic, i.e. the address the panel is
+# actually reachable on. Uses the routing table rather than picking the first
+# entry from `ip addr`, so tunnel/docker/loopback interfaces can't win. Prints
+# nothing if it cannot be determined.
+primary_local_ip() {
+  local addr=""
+  if command -v ip >/dev/null 2>&1; then
+    addr=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}') || addr=""
+  fi
+  if [[ -z "$addr" ]] && command -v hostname >/dev/null 2>&1; then
+    addr=$(hostname -I 2>/dev/null | awk '{print $1}') || addr=""
+  fi
+  [[ "$addr" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || addr=""
+  printf '%s' "$addr"
+}
+
+# rebind_stale_inbound_listens — 3x-ui stores a per-inbound `listen` address,
+# and when the source panel pinned its inbounds to the source server's own
+# public IP, that literal travels with the database. On the target that
+# address is not assigned to any interface, so xray-core dies with
+# "bind: cannot assign requested address" and CRASH-LOOPS: the panel itself
+# comes up fine and every sanity count matches, but not one inbound is
+# actually listening. That failure is silent from the restore script's point
+# of view, which is exactly why it has to be handled here rather than left
+# for the user to discover.
+#
+# The rewrite is the user's call, not the script's: a `listen` that is a
+# non-empty IP literal not present on this host CAN be rewritten to THIS
+# server's own primary IP, so an inbound that was deliberately pinned on the
+# source stays pinned on the target — just to the right address. Values that
+# are already bindable here, or already empty, are never touched.
+#
+# Deciding requires knowing which inbounds are actually affected, so the
+# question is asked only after the scan and always lists them by name. In
+# interactive mode that's a prompt; --rebind-listen / --no-rebind-listen
+# answer it up front, and --listen-address overrides the detected IP (an
+# empty value means '' — 3x-ui's default of binding all interfaces, which is
+# also the fallback when the primary IP cannot be determined).
+rebind_stale_inbound_listens() {
+  if [[ "$REBIND_LISTEN" == "no" ]]; then
+    log_info "Leaving inbound listen addresses exactly as they were on the source (--no-rebind-listen)."
+    return 0
+  fi
+
+  local rows=""
+  if [[ "$BACKEND" == "postgres" ]]; then
+    rows=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tA -F '|' \
+      -c "SELECT id, listen, remark FROM inbounds WHERE listen IS NOT NULL AND listen <> '';" 2>/dev/null) || rows=""
+  else
+    rows=$(sqlite3 -separator '|' "$SQLITE_PATH" \
+      "SELECT id, listen, remark FROM inbounds WHERE listen IS NOT NULL AND listen != '';" 2>/dev/null) || rows=""
+  fi
+  [[ -z "$rows" ]] && return 0
+
+  local new_listen="$LISTEN_ADDRESS_OVERRIDE" described=""
+  if [[ -z "$new_listen" ]]; then
+    new_listen=$(primary_local_ip)
+  fi
+  if [[ -n "$new_listen" ]]; then
+    described="this server's IP ${new_listen}"
+  else
+    described="all interfaces (this server's primary IP could not be determined)"
+  fi
+
+  local locals=""; locals=$(local_ip_literals)
+  local stale_ids=() stale_desc=() id listen remark
+  while IFS='|' read -r id listen remark; do
+    [[ -z "$id" ]] && continue
+    if ! grep -qxF "$listen" <<<"$locals"; then
+      stale_ids+=("$id")
+      stale_desc+=("Inbound ${id} (${remark:-unnamed}) is pinned to ${listen}")
+    fi
+  done <<<"$rows"
+
+  if [[ ${#stale_ids[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  # Only now is there anything to decide about — show exactly what is
+  # affected before asking, so the choice is informed rather than abstract.
+  log_warn "${#stale_ids[@]} inbound(s) are pinned to an IP address this server does not have:"
+  local d
+  for d in "${stale_desc[@]}"; do
+    printf '         - %s\n' "$d"
+  done
+  log_warn "xray-core cannot bind a foreign address: left as-is, it will crash-loop and NONE of your inbounds will serve traffic."
+  log_info "Proposed change: rebind them to ${described}."
+
+  if [[ "$REBIND_LISTEN" == "auto" ]]; then
+    # This point is reached with x-ui already stopped and the database
+    # already replaced, so bailing out here would strand the panel down.
+    # Non-interactive runs therefore take the conservative branch — change
+    # nothing, say so loudly — rather than either dying or silently deciding
+    # on the user's behalf.
+    if [[ "$ASSUME_YES" -eq 1 ]]; then
+      log_warn "Non-interactive run with no --rebind-listen/--no-rebind-listen: leaving these inbounds unchanged."
+      log_warn "Re-run with --rebind-listen to rebind them to ${described}."
+      return 0
+    fi
+    local reply=""
+    read -r -p "Rebind these ${#stale_ids[@]} inbound(s)? [y/N]: " reply || reply=""
+    if [[ ! "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+      log_warn "Leaving inbound listen addresses unchanged, as chosen. Expect xray-core to fail until you fix them in the panel."
+      return 0
+    fi
+  fi
+
+  local id_list; id_list=$(IFS=,; printf '%s' "${stale_ids[*]}")
+  if [[ "$BACKEND" == "postgres" ]]; then
+    PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -q \
+      -c "UPDATE inbounds SET listen = '${new_listen}' WHERE id IN (${id_list});" 2>"$WORKDIR/pg_rebind.stderr" \
+      || die "$EXIT_RESTORE_FAILED" "Could not rewrite stale inbound listen addresses." "$(cat "$WORKDIR/pg_rebind.stderr" 2>/dev/null)"
+  else
+    sqlite3 "$SQLITE_PATH" "UPDATE inbounds SET listen = '${new_listen}' WHERE id IN (${id_list});" 2>"$WORKDIR/sqlite_rebind.stderr" \
+      || die "$EXIT_RESTORE_FAILED" "Could not rewrite stale inbound listen addresses." "$(cat "$WORKDIR/sqlite_rebind.stderr" 2>/dev/null)"
+  fi
+  log_success "Rebound ${#stale_ids[@]} inbound(s) to ${described} (they were pinned to the source server's IP)."
+}
+
+# verify_xray_running — the panel process starting is NOT proof the migration
+# worked: xray-core is a child of x-ui and restarts on its own, so a config
+# it cannot apply shows up as a crash-loop behind a perfectly healthy-looking
+# "active" unit. Scan the service log written since x-ui was started for
+# xray's own start/failure lines and report what actually happened.
+verify_xray_running() {
+  local since="$1" logtxt=""
+  logtxt=$(journalctl -u "$XUI_SERVICE" --since "$since" --no-pager 2>/dev/null) || return 0
+  [[ -z "$logtxt" ]] && return 0
+  if grep -q 'Failure in running xray-core' <<<"$logtxt"; then
+    log_error "xray-core is failing to start — the panel is up but your inbounds are NOT serving traffic."
+    grep -o 'XRAY: Failed to start:.*' <<<"$logtxt" | tail -1 | sed 's/^/         /' || true
+    log_error "Check the inbound settings in the panel, then: systemctl restart ${XUI_SERVICE}"
+    return 1
+  fi
+  if grep -q 'XRAY: core: Xray .* started' <<<"$logtxt"; then
+    log_success "xray-core started cleanly with the restored configuration."
+  fi
+  return 0
+}
 # ============================================================================
 
 trap 'rc=$?; [[ $rc -ge 2 ]] && exit "$rc"; die "$EXIT_GENERIC" "Unexpected error on line $LINENO (command: $BASH_COMMAND)"' ERR
@@ -533,9 +828,23 @@ Options:
   --archive PATH          Local path to the backup tarball (prompted if omitted)
   --yes                   Non-interactive mode for informational prompts (requires --confirm-restore)
   --confirm-restore       Explicit non-interactive equivalent of typing RESTORE
+  --rebind-listen         Rebind, without asking, any inbound pinned to an IP
+                          this server does not have (xray-core cannot bind a
+                          foreign address and would otherwise crash-loop with
+                          every inbound offline).
+  --no-rebind-listen      Never rebind; keep each inbound's listen address
+                          exactly as it was on the source.
+  --listen-address ADDR   Address to rebind to (default: this server's own
+                          primary IP, auto-detected). Pass an empty value to
+                          bind all interfaces instead.
+  --service-timeout SECS  Seconds to wait for x-ui to stop/start (default 30, or XUI_MOVER_SERVICE_TIMEOUT)
   --dry-run               Print what would happen without making changes
   --no-color              Disable colored output
   -h, --help               Show this help and exit
+
+Without --rebind-listen or --no-rebind-listen, restore.sh only asks about
+inbounds it finds are actually unbindable here, and lists them first. In
+non-interactive mode (--yes) it does not guess: pass one of the two flags.
 
 SAFETY: restore.sh replaces all existing panel data on this server. In
 interactive mode you must type RESTORE at the confirmation prompt before
@@ -545,10 +854,24 @@ EOF
 }
 
 parse_flags() {
+  require_flag_arg() {
+    local flag="$1"
+    if [[ $# -lt 2 || -z "${2:-}" || "${2}" == --* ]]; then
+      echo "Missing value for $flag" >&2
+      usage
+      exit "$EXIT_BAD_ARGS"
+    fi
+  }
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --archive) ARCHIVE_PATH="${2:-}"; shift 2 ;;
+      --rebind-listen) REBIND_LISTEN="yes"; shift ;;
+      --no-rebind-listen|--keep-listen-addresses) REBIND_LISTEN="no"; shift ;;
+      --listen-address) LISTEN_ADDRESS_OVERRIDE="${2:-}"; shift 2 ;;
+      --listen-address=*) LISTEN_ADDRESS_OVERRIDE="${1#*=}"; shift ;;
+      --archive) require_flag_arg "$@"; ARCHIVE_PATH="$2"; shift 2 ;;
       --archive=*) ARCHIVE_PATH="${1#*=}"; shift ;;
+      --service-timeout) require_flag_arg "$@"; SERVICE_TIMEOUT_SECS="$2"; shift 2 ;;
+      --service-timeout=*) SERVICE_TIMEOUT_SECS="${1#*=}"; shift ;;
       --yes) ASSUME_YES=1; shift ;;
       --confirm-restore) CONFIRM_RESTORE=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
@@ -557,6 +880,10 @@ parse_flags() {
       *) echo "Unknown option: $1" >&2; usage; exit "$EXIT_BAD_ARGS" ;;
     esac
   done
+  if [[ -n "$SERVICE_TIMEOUT_SECS" && ! "$SERVICE_TIMEOUT_SECS" =~ ^[0-9]+$ ]]; then
+    echo "Invalid --service-timeout value: $SERVICE_TIMEOUT_SECS" >&2
+    exit "$EXIT_BAD_ARGS"
+  fi
   if [[ "$ASSUME_YES" -eq 1 && "$CONFIRM_RESTORE" -ne 1 ]]; then
     echo "Non-interactive mode requires --confirm-restore as well (never bypass the safety gate implicitly)." >&2
     exit "$EXIT_BAD_ARGS"
@@ -576,8 +903,9 @@ main() {
   discover_xui_installation XUI_SERVICE xui_bin
   make_workdir
   trap cleanup EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  trap 'handle_interrupt 130' INT
+  trap 'handle_interrupt 143' TERM
+  require_free_space "$WORK_ROOT" 262144
   log_info "Working directory: $WORKDIR"
 
   step_banner 2 9 "Reading target configuration"
@@ -641,7 +969,7 @@ main() {
   else
     summary_lines+=("Target file: $SQLITE_PATH")
   fi
-  summary_lines+=("" "ALL EXISTING PANEL DATA ON THIS SERVER WILL BE REPLACED." "This cannot be undone.")
+  summary_lines+=("" "ALL EXISTING PANEL DATA ON THIS SERVER WILL BE REPLACED." "A timestamped pre-restore snapshot will be kept under $WORK_ROOT.")
   print_box "${summary_lines[@]}"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     log_info "[DRY RUN] would require typed confirmation 'RESTORE' here; skipping since --dry-run makes no changes."
@@ -656,6 +984,9 @@ main() {
   step_banner 5 9 "Stopping x-ui"
   run_step "stop x-ui" xui_stop_and_wait
   log_success "x-ui stopped."
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    take_pre_restore_snapshot
+  fi
 
   step_banner 6 9 "Restoring database"
   if [[ "$BACKEND" == "postgres" ]]; then
@@ -691,28 +1022,35 @@ main() {
       fi
     fi
   fi
+  # Must run while x-ui is still stopped and after the database is in place,
+  # so xray-core reads the corrected inbounds on its very first start.
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log_info "[DRY RUN] would: scan for inbounds pinned to an IP this server does not have, and ask whether to rebind them to $(primary_local_ip)"
+  else
+    rebind_stale_inbound_listens
+  fi
   log_success "Database restored."
 
   step_banner 7 9 "Restoring certificates"
-  if [[ -d "$BUNDLE_DIR/cert" && -n "$(ls -A "$BUNDLE_DIR/cert" 2>/dev/null)" ]]; then
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-      log_info "[DRY RUN] would: copy certs into $XUI_CERT_DIR"
-    else
-      mkdir -p "$XUI_CERT_DIR"
-      if ! cp -a "$BUNDLE_DIR/cert/." "$XUI_CERT_DIR/"; then
-        die "$EXIT_CERT_RESTORE_FAILED" "Failed to copy certs into $XUI_CERT_DIR."
-      fi
-      find "$XUI_CERT_DIR" -type f -iname '*key*' -exec chmod 600 {} \; 2>/dev/null || true
-      find "$XUI_CERT_DIR" -type f \( -iname '*.pem' -o -iname '*.crt' \) ! -iname '*key*' -exec chmod 644 {} \; 2>/dev/null || true
-      log_success "Certs restored to $XUI_CERT_DIR."
-    fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log_info "[DRY RUN] would: restore certs, acme.sh, Let's Encrypt, and extra cert paths from the archive"
   else
-    log_warn "Archive contains no certs — skipping cert restore."
+    restore_panel_certs "$BUNDLE_DIR"
+    harden_cert_permissions "$XUI_CERT_DIR"
+    harden_cert_permissions /root/.acme.sh
+    harden_cert_permissions /etc/letsencrypt
   fi
 
   step_banner 8 9 "Starting x-ui"
+  local xray_watch_since=""
+  xray_watch_since=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null) || xray_watch_since=""
   run_step "start x-ui" xui_start_and_wait
   log_success "x-ui started."
+  if [[ "$DRY_RUN" -eq 0 && -n "$xray_watch_since" ]]; then
+    # xray-core is started by the panel a moment after the unit goes active.
+    sleep 8
+    verify_xray_running "$xray_watch_since" || XRAY_UNHEALTHY=1
+  fi
 
   step_banner 9 9 "Sanity check & summary"
   local inbounds_count="?" users_count="?" settings_count="?"
@@ -725,16 +1063,25 @@ main() {
     if [[ -n "$SOURCE_INBOUNDS" && "$inbounds_count" != "$SOURCE_INBOUNDS" ]]; then
       log_warn "Restored inbounds count ($inbounds_count) differs from the source backup's recorded count ($SOURCE_INBOUNDS) — verify manually."
     fi
+    if [[ -n "$SOURCE_USERS" && "$users_count" != "$SOURCE_USERS" ]]; then
+      log_warn "Restored users count ($users_count) differs from the source backup's recorded count ($SOURCE_USERS) — verify manually."
+    fi
     if [[ -n "$SOURCE_SETTINGS" && "$settings_count" != "$SOURCE_SETTINGS" ]]; then
       log_warn "Restored settings row count ($settings_count) differs from the source backup's recorded count ($SOURCE_SETTINGS) — panel settings/Xray configuration may not have carried over correctly, verify manually."
     fi
   fi
+  local xray_line="xray-core: running"
+  [[ "$XRAY_UNHEALTHY" -eq 1 ]] && xray_line="xray-core: FAILING TO START — inbounds are NOT serving traffic"
+  [[ "$DRY_RUN" -eq 1 ]] && xray_line=""
   print_summary "Restore complete" \
     "Backend: $BACKEND" \
     "Inbounds restored: $inbounds_count   Users restored: $users_count   Settings rows restored: $settings_count" \
     "x-ui service: active" \
+    "${xray_line}" \
+    "${PRE_RESTORE_SNAPSHOT:+Pre-restore snapshot: $PRE_RESTORE_SNAPSHOT}" \
     "" \
     "Next: log into your panel and confirm your inbounds/clients are present."
+  [[ "$XRAY_UNHEALTHY" -eq 1 ]] && exit "$EXIT_RESTORE_FAILED"
   exit 0
 }
 

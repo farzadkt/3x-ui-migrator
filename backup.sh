@@ -7,7 +7,7 @@
 # pushes it directly to the target over SSH.
 #
 # Usage:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/alionthecode/xui-mover/main/backup.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/farzadkt/3x-ui-migrator/main/backup.sh)
 #   backup.sh --push-to root@1.2.3.4
 #
 # Run `backup.sh --help` for the full flag list. Must be run as root on a
@@ -34,7 +34,7 @@ readonly XUI_SQLITE_FILENAME="x-ui.db"
 readonly XUI_CERT_DIR="/root/cert"
 readonly WORK_ROOT="/root/xui-mover"
 readonly REMOTE_INCOMING_DIR_DEFAULT="/root/xui-mover-incoming"
-readonly SERVICE_TIMEOUT_SECS=30
+SERVICE_TIMEOUT_SECS="${XUI_MOVER_SERVICE_TIMEOUT:-30}"
 readonly TOOL_VERSION="1.0.0"
 
 readonly EXIT_GENERIC=1
@@ -63,6 +63,7 @@ readonly EXIT_SANITY_CHECK_FAILED=23
 readonly EXIT_SERVICE_START_FAILED=24
 readonly EXIT_CERT_RESTORE_FAILED=25
 readonly EXIT_BAD_ARGS=26
+readonly EXIT_DISK_FULL=27
 
 DRY_RUN=0
 NO_COLOR_FLAG=0
@@ -73,6 +74,9 @@ SERVICE_STOPPED=0
 XUI_SERVICE=""     # discovered at runtime by discover_xui_installation — never hardcoded
 PG_USER=""; PG_PASS=""; PG_HOST=""; PG_PORT=""; PG_DB=""; PG_CONN_NOAUTH=""
 SSH_USE_PASSWORD=0; SSH_PASSWORD=""
+STDIO_REDIRECTED=0
+INTERRUPT_RESTART_XUI=0
+PRE_RESTORE_SNAPSHOT=""
 C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_BOLD=""; C_RESET=""
 
 ui_supports_color() {
@@ -94,9 +98,21 @@ setup_logging() {
     mkdir -p "$WORK_ROOT" 2>/dev/null || true
     LOG_FILE="$WORK_ROOT/xui-mover-${ts}.log"
   fi
+  chmod 600 "$LOG_FILE" 2>/dev/null || true
+  exec 3>&1 4>&2
   exec > >(tee >(sed -u -r 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE")) 2>&1
+  STDIO_REDIRECTED=1
   log_info "Logging to $LOG_FILE"
 }
+
+flush_logs() {
+  if [[ "${STDIO_REDIRECTED:-0}" -eq 1 ]]; then
+    exec 1>&3 2>&4
+    exec 3>&- 4>&-
+    STDIO_REDIRECTED=0
+  fi
+}
+
 
 log_info()    { printf '%s[INFO]%s %s\n' "$C_BLUE" "$C_RESET" "$1"; }
 log_warn()    { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$1"; }
@@ -110,7 +126,9 @@ step_banner() {
 print_box() {
   local line max=0
   for line in "$@"; do (( ${#line} > max )) && max=${#line}; done
-  local border; border=$(printf -- '-%.0s' $(seq 1 $((max + 2))))
+  local border
+  # shellcheck disable=SC2046
+  border=$(printf -- '-%.0s' $(seq 1 $((max + 2))))
   printf '%s+%s+%s\n' "$C_BOLD" "$border" "$C_RESET"
   for line in "$@"; do
     printf '%s|%s %-*s %s|%s\n' "$C_BOLD" "$C_RESET" "$max" "$line" "$C_BOLD" "$C_RESET"
@@ -133,6 +151,7 @@ die() {
       tail_xui_log 20
     fi
   } >&2
+  flush_logs
   exit "$code"
 }
 
@@ -163,6 +182,7 @@ make_workdir() {
 }
 
 cleanup() {
+  flush_logs
   if [[ -n "${WORKDIR:-}" && "$WORKDIR" == "$WORK_ROOT"/run-* && -d "$WORKDIR" ]]; then
     rm -rf "$WORKDIR" || true
   fi
@@ -185,6 +205,29 @@ require_supported_os() {
 
 require_systemd() {
   command -v systemctl >/dev/null 2>&1 || die "$EXIT_UNSUPPORTED_OS" "systemd (systemctl) not found." "This tool requires a systemd-based host."
+}
+
+require_free_space() {
+  local dir="$1" min_kb="${2:-262144}"
+  mkdir -p "$dir" 2>/dev/null || true
+  local avail=""
+  avail=$(df -Pk "$dir" 2>/dev/null | awk 'NR==2 {print $4}') || avail=""
+  [[ "$avail" =~ ^[0-9]+$ ]] || return 0
+  if (( avail < min_kb )); then
+    die "$EXIT_DISK_FULL" "Not enough free space in $dir (${avail} KB available, need at least ${min_kb} KB)." "Free some disk space and re-run."
+  fi
+}
+
+handle_interrupt() {
+  local code="$1"
+  if [[ "${INTERRUPT_RESTART_XUI:-0}" -eq 1 && -n "${XUI_SERVICE:-}" ]]; then
+    log_warn "Interrupted — restarting x-ui so the panel is not left down."
+    systemctl start "$XUI_SERVICE" >/dev/null 2>&1 || log_error "Could not restart x-ui after interrupt. Start it manually: systemctl start ${XUI_SERVICE}"
+  elif [[ -n "${PRE_RESTORE_SNAPSHOT:-}" ]]; then
+    log_warn "Interrupted during restore. Pre-restore snapshot kept at $PRE_RESTORE_SNAPSHOT. x-ui left stopped."
+  fi
+  flush_logs
+  exit "$code"
 }
 
 # resolve_xui_env_file OUT_VAR — the env file is genuinely optional: x-ui's
@@ -293,22 +336,43 @@ get_xui_version() {
 }
 
 url_decode() {
-  local data="${1//+/ }"
-  printf '%b' "${data//%/\\x}"
+  local data="$1" out="" i=0 c hex
+  local len=${#data}
+  while (( i < len )); do
+    c="${data:i:1}"
+    if [[ "$c" == "%" ]]; then
+      hex="${data:i+1:2}"
+      if [[ "$hex" =~ ^[0-9A-Fa-f]{2}$ ]]; then
+        printf -v c '%b' "\\x${hex}"
+        out+="$c"
+        i=$((i + 3))
+        continue
+      fi
+    fi
+    out+="$c"
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
 }
 
 parse_pg_dsn() {
   local dsn="$1"
-  if [[ "$dsn" =~ ^postgres(ql)?://([^:@/]+):([^@]*)@([^:/]+):([0-9]+)/([^?]+)(\?(.*))?$ ]]; then
+  if [[ "$dsn" =~ ^postgres(ql)?://([^:/@]+)(:([^@]*))?@(\[[^]]+\]|[^:/]+)(:([0-9]+))?/([^?]+)(\?(.*))?$ ]]; then
     PG_USER="${BASH_REMATCH[2]}"
-    PG_PASS="$(url_decode "${BASH_REMATCH[3]}")"
-    PG_HOST="${BASH_REMATCH[4]}"
-    PG_PORT="${BASH_REMATCH[5]}"
-    PG_DB="${BASH_REMATCH[6]}"
-    local query="${BASH_REMATCH[8]}"
+    if [[ -n "${BASH_REMATCH[3]}" ]]; then
+      PG_PASS="$(url_decode "${BASH_REMATCH[4]}")"
+    else
+      PG_PASS=""
+    fi
+    PG_HOST="${BASH_REMATCH[5]}"
+    PG_HOST="${PG_HOST#[}"
+    PG_HOST="${PG_HOST%]}"
+    PG_PORT="${BASH_REMATCH[7]:-5432}"
+    PG_DB="${BASH_REMATCH[8]}"
+    local query="${BASH_REMATCH[10]}"
     PG_CONN_NOAUTH="postgres://${PG_HOST}:${PG_PORT}/${PG_DB}${query:+?$query}"
   else
-    die "$EXIT_DSN_PARSE_FAILED" "Could not parse XUI_DB_DSN." "Expected format: postgres://user:pass@host:port/dbname?sslmode=disable"
+    die "$EXIT_DSN_PARSE_FAILED" "Could not parse XUI_DB_DSN." "Expected format: postgres://user[:pass]@host[:port]/dbname[?sslmode=disable] — password and port are optional (port defaults to 5432)."
   fi
 }
 
@@ -451,14 +515,31 @@ tail_xui_log() {
 }
 
 count_nodes_rows() {
-  local n=""
+  local n="" err=""
   if [[ "$BACKEND" == "postgres" ]]; then
-    n=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc 'SELECT count(*) FROM nodes;' 2>/dev/null) || n="0"
+    n=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc 'SELECT count(*) FROM nodes;' 2>"$WORKDIR/nodes.stderr") || {
+      err=$(cat "$WORKDIR/nodes.stderr" 2>/dev/null || true)
+      if [[ "$err" == *"does not exist"* ]]; then
+        printf '0'
+        return 0
+      fi
+      die "$EXIT_SANITY_CHECK_FAILED" "Could not determine node count (refusing to skip the multi-node guard)." "$err"
+    }
   else
-    n=$(sqlite3 "$SQLITE_PATH" 'SELECT count(*) FROM nodes;' 2>/dev/null) || n="0"
+    n=$(sqlite3 "$SQLITE_PATH" 'SELECT count(*) FROM nodes;' 2>"$WORKDIR/nodes.stderr") || {
+      err=$(cat "$WORKDIR/nodes.stderr" 2>/dev/null || true)
+      if [[ "$err" == *"no such table"* ]]; then
+        printf '0'
+        return 0
+      fi
+      die "$EXIT_SANITY_CHECK_FAILED" "Could not determine node count (refusing to skip the multi-node guard)." "$err"
+    }
   fi
   n="${n//[[:space:]]/}"
   [[ -z "$n" ]] && n="0"
+  if [[ ! "$n" =~ ^[0-9]+$ ]]; then
+    die "$EXIT_SANITY_CHECK_FAILED" "Node count query returned a non-numeric value." "Got: ${n:0:80}"
+  fi
   printf '%s' "$n"
 }
 
@@ -506,8 +587,21 @@ verify_local_checksum() {
   fi
 }
 
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
 write_meta_json() {
   local out_file="$1" hostname_v="$2" backend_v="$3" xui_version_v="$4" inbounds_v="$5" users_v="$6" settings_v="$7" nodes_v="$8"
+  hostname_v="$(json_escape "$hostname_v")"
+  backend_v="$(json_escape "$backend_v")"
+  xui_version_v="$(json_escape "$xui_version_v")"
   cat > "$out_file" <<EOF
 {
   "tool_version": "${TOOL_VERSION}",
@@ -561,10 +655,13 @@ push_archive() {
   local local_sum=""; local_sum=$(sha256sum "$local_tar" | awk '{print $1}')
 
   rc=0
+  local remote_dir_q tar_q
+  printf -v remote_dir_q '%q' "$remote_dir"
+  printf -v tar_q '%q' "${remote_dir}/$(basename "$local_tar")"
   if [[ "$SSH_USE_PASSWORD" -eq 1 ]]; then
-    SSHPASS="$SSH_PASSWORD" sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no "${opts[@]}" "$user_host" "mkdir -p '$remote_dir'" || rc=$?
+    SSHPASS="$SSH_PASSWORD" sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no "${opts[@]}" "$user_host" "mkdir -p ${remote_dir_q}" || rc=$?
   else
-    ssh "${opts[@]}" "$user_host" "mkdir -p '$remote_dir'" || rc=$?
+    ssh "${opts[@]}" "$user_host" "mkdir -p ${remote_dir_q}" || rc=$?
   fi
   [[ $rc -ne 0 ]] && die "$EXIT_PUSH_VERIFY_FAILED" "Failed to create remote directory $remote_dir on $user_host."
 
@@ -581,15 +678,64 @@ push_archive() {
 
   local remote_sum=""
   if [[ "$SSH_USE_PASSWORD" -eq 1 ]]; then
-    remote_sum=$(SSHPASS="$SSH_PASSWORD" sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no "${opts[@]}" "$user_host" "sha256sum '${remote_dir}/$(basename "$local_tar")'" 2>/dev/null | awk '{print $1}') || remote_sum=""
+    remote_sum=$(SSHPASS="$SSH_PASSWORD" sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no "${opts[@]}" "$user_host" "sha256sum ${tar_q}" 2>/dev/null | awk '{print $1}') || remote_sum=""
   else
-    remote_sum=$(ssh "${opts[@]}" "$user_host" "sha256sum '${remote_dir}/$(basename "$local_tar")'" 2>/dev/null | awk '{print $1}') || remote_sum=""
+    remote_sum=$(ssh "${opts[@]}" "$user_host" "sha256sum ${tar_q}" 2>/dev/null | awk '{print $1}') || remote_sum=""
   fi
 
   if [[ -z "$remote_sum" || "$remote_sum" != "$local_sum" ]]; then
     die "$EXIT_PUSH_VERIFY_FAILED" "Remote checksum did not match local checksum after transfer." "Local: $local_sum  Remote: ${remote_sum:-<missing>}"
   fi
   REMOTE_ARCHIVE_PATH="${remote_dir}/$(basename "$local_tar")"
+}
+
+list_cert_paths_from_db() {
+  local sql="SELECT value FROM settings WHERE key IN ('webCertFile','webKeyFile');"
+  local raw="" blob=""
+  if [[ "${BACKEND:-}" == "postgres" ]]; then
+    raw=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc "$sql" 2>/dev/null) || raw=""
+    blob=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_CONN_NOAUTH" -tAc 'SELECT settings FROM inbounds;' 2>/dev/null) || blob=""
+  elif [[ -n "${SQLITE_PATH:-}" && -f "$SQLITE_PATH" ]]; then
+    raw=$(sqlite3 "$SQLITE_PATH" "$sql" 2>/dev/null) || raw=""
+    blob=$(sqlite3 "$SQLITE_PATH" 'SELECT settings FROM inbounds;' 2>/dev/null) || blob=""
+  fi
+  printf '%s\n' "$raw"
+  printf '%s' "$blob" | grep -oE '/[^[:space:]\"'\'']+\.(pem|crt|key|cer|cert)' || true
+}
+
+collect_panel_certs() {
+  local dest="$1" copied=0 path rel
+  mkdir -p "$dest/cert"
+  if [[ -d "$XUI_CERT_DIR" ]]; then
+    cp -a "$XUI_CERT_DIR/." "$dest/cert/"
+  fi
+  mkdir -p "$dest/extra-certs"
+  if [[ -d /root/.acme.sh ]]; then
+    cp -a /root/.acme.sh "$dest/extra-certs/acme.sh"
+    copied=1
+    log_info "Captured /root/.acme.sh"
+  fi
+  if [[ -d /etc/letsencrypt ]]; then
+    cp -a /etc/letsencrypt "$dest/extra-certs/letsencrypt"
+    copied=1
+    log_info "Captured /etc/letsencrypt"
+  fi
+  : >"$dest/extra-certs/paths.list"
+  while IFS= read -r path; do
+    [[ -z "$path" || ! -e "$path" ]] && continue
+    case "$path" in
+      "$XUI_CERT_DIR"/*|/root/.acme.sh/*|/etc/letsencrypt/*) continue ;;
+    esac
+    rel="files${path}"
+    mkdir -p "$dest/extra-certs/$(dirname "$rel")"
+    cp -a "$path" "$dest/extra-certs/$rel"
+    printf '%s\n' "$path" >> "$dest/extra-certs/paths.list"
+    copied=1
+    log_info "Captured extra cert path: $path"
+  done < <(list_cert_paths_from_db)
+  if [[ "$copied" -eq 0 ]]; then
+    rm -rf "$dest/extra-certs"
+  fi
 }
 
 run_step() {
@@ -630,6 +776,7 @@ Options:
   -i, --identity PATH            SSH private key to use for --push-to
   --remote-dir PATH              Remote directory to push into (default: /root/xui-mover-incoming)
   --i-know-this-is-multi-node    Proceed even if this panel has registered nodes (v1 does not migrate node data)
+  --service-timeout SECS         Seconds to wait for x-ui to stop/start (default 30, or XUI_MOVER_SERVICE_TIMEOUT)
   --yes                          Assume yes on informational prompts (does not bypass the multi-node guard)
   --dry-run                      Print what would happen without making changes
   --no-color                     Disable colored output
@@ -641,14 +788,24 @@ EOF
 }
 
 parse_flags() {
+  require_flag_arg() {
+    local flag="$1"
+    if [[ $# -lt 2 || -z "${2:-}" || "${2}" == --* ]]; then
+      echo "Missing value for $flag" >&2
+      usage
+      exit "$EXIT_BAD_ARGS"
+    fi
+  }
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --push-to) PUSH_TO="${2:-}"; shift 2 ;;
+      --push-to) require_flag_arg "$@"; PUSH_TO="$2"; shift 2 ;;
       --push-to=*) PUSH_TO="${1#*=}"; shift ;;
-      -i|--identity) SSH_IDENTITY="${2:-}"; shift 2 ;;
+      -i|--identity) require_flag_arg "$@"; SSH_IDENTITY="$2"; shift 2 ;;
       --identity=*) SSH_IDENTITY="${1#*=}"; shift ;;
-      --remote-dir) REMOTE_DIR="${2:-}"; shift 2 ;;
+      --remote-dir) require_flag_arg "$@"; REMOTE_DIR="$2"; shift 2 ;;
       --remote-dir=*) REMOTE_DIR="${1#*=}"; shift ;;
+      --service-timeout) require_flag_arg "$@"; SERVICE_TIMEOUT_SECS="$2"; shift 2 ;;
+      --service-timeout=*) SERVICE_TIMEOUT_SECS="${1#*=}"; shift ;;
       --i-know-this-is-multi-node) MULTI_NODE_OVERRIDE=1; shift ;;
       --yes) ASSUME_YES=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
@@ -657,6 +814,10 @@ parse_flags() {
       *) echo "Unknown option: $1" >&2; usage; exit "$EXIT_BAD_ARGS" ;;
     esac
   done
+  if [[ -n "$SERVICE_TIMEOUT_SECS" && ! "$SERVICE_TIMEOUT_SECS" =~ ^[0-9]+$ ]]; then
+    echo "Invalid --service-timeout value: $SERVICE_TIMEOUT_SECS" >&2
+    exit "$EXIT_BAD_ARGS"
+  fi
   if [[ -n "$PUSH_TO" ]]; then
     if [[ "$PUSH_TO" =~ ^([^@]+)@([^:]+):([0-9]+)$ ]]; then
       SSH_USER_HOST="${BASH_REMATCH[1]}@${BASH_REMATCH[2]}"
@@ -684,8 +845,9 @@ main() {
   discover_xui_installation XUI_SERVICE xui_bin
   make_workdir
   trap cleanup EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  trap 'handle_interrupt 130' INT
+  trap 'handle_interrupt 143' TERM
+  require_free_space "$WORK_ROOT" 262144
   log_info "Working directory: $WORKDIR"
 
   step_banner 2 8 "Detecting backend"
@@ -706,6 +868,10 @@ main() {
     parse_pg_dsn "$dsn"
     pg_client_precheck
     log_info "Postgres target: $(mask_dsn "$dsn")"
+    if ! pg_test_connection; then
+      die "$EXIT_PG_TARGET_NOT_PROVISIONED" "Cannot connect to Postgres with the parsed DSN." "Check XUI_DB_DSN in $env_file and that PostgreSQL is running."
+    fi
+    log_success "Connected to source Postgres database."
   else
     sqlite_client_precheck
     SQLITE_PATH=$(resolve_sqlite_path "$env_file")
@@ -728,10 +894,14 @@ main() {
   else
     local was_active=1
     xui_is_active && was_active=0
+    if [[ $was_active -eq 0 ]]; then
+      INTERRUPT_RESTART_XUI=1
+    fi
     run_step "stop x-ui for a consistent snapshot" xui_stop_and_wait
     run_step "copy $SQLITE_PATH (+ WAL/SHM if present)" sqlite_copy_with_sidecars "$SQLITE_PATH" "$WORKDIR/db/x-ui.db"
     if [[ "$DRY_RUN" -eq 0 && $was_active -eq 0 ]]; then
       run_step "restart x-ui" xui_start_and_wait
+      INTERRUPT_RESTART_XUI=0
     fi
     if [[ "$DRY_RUN" -eq 0 ]]; then
       sqlite_sanity_counts "$WORKDIR/db/x-ui.db" inbounds_count users_count settings_count
@@ -740,17 +910,20 @@ main() {
   log_success "Dump complete (inbounds: ${inbounds_count:-0}, users: ${users_count:-0}, settings rows: ${settings_count:-0})"
 
   step_banner 5 8 "Collecting certs and reference config"
-  if [[ -d "$XUI_CERT_DIR" ]]; then
-    run_step "copy $XUI_CERT_DIR" cp -a "$XUI_CERT_DIR" "$WORKDIR/cert"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log_info "[DRY RUN] would: copy $XUI_CERT_DIR, /root/.acme.sh, /etc/letsencrypt, and DB-referenced cert paths"
   else
-    log_warn "$XUI_CERT_DIR not found — skipping (no certs to back up)."
-    mkdir -p "$WORKDIR/cert"
+    collect_panel_certs "$WORKDIR"
   fi
-  {
-    printf '# REFERENCE ONLY — captured from %s on %s.\n' "$env_file" "$(hostname)"
-    printf '# Do NOT apply this file verbatim on the target: XUI_DB_DSN is server-specific.\n#\n'
-    cat "$env_file"
-  } > "$WORKDIR/etc-default-x-ui.reference"
+  if [[ -n "$env_file" && -r "$env_file" ]]; then
+    {
+      printf '# REFERENCE ONLY — captured from %s on %s.\n' "$env_file" "$(hostname)"
+      printf '# Do NOT apply this file verbatim on the target: XUI_DB_DSN is server-specific.\n#\n'
+      cat "$env_file"
+    } > "$WORKDIR/etc-default-x-ui.reference"
+  else
+    printf '# No environment file on source (typical for SQLite-only installs).\n' > "$WORKDIR/etc-default-x-ui.reference"
+  fi
   write_meta_json "$WORKDIR/meta.json" "$(hostname)" "$BACKEND" "$xui_version" "${inbounds_count:-0}" "${users_count:-0}" "${settings_count:-0}" "${node_count:-0}"
   log_success "Collected certs and metadata."
 
@@ -760,7 +933,11 @@ main() {
   archive_name="xui-backup-$(hostname)-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
   archive="$WORK_ROOT/$archive_name"
   archive_stem="${archive_name%.tar.gz}"
-  run_step "tar czf $archive" build_archive "$archive" "$WORKDIR" "$archive_stem" meta.json db cert etc-default-x-ui.reference
+  local archive_members=(meta.json db cert etc-default-x-ui.reference)
+  if [[ -d "$WORKDIR/extra-certs" ]]; then
+    archive_members+=(extra-certs)
+  fi
+  run_step "tar czf $archive" build_archive "$archive" "$WORKDIR" "$archive_stem" "${archive_members[@]}"
   if [[ "$DRY_RUN" -eq 0 ]]; then
     checksum=$(checksum_file "$archive")
     verify_local_checksum "$archive"
