@@ -11,7 +11,19 @@ Severity legend: **[HIGH]** can cause data loss, a broken migration, or a false
 "success"; **[MED]** wrong behavior / degraded reliability in realistic cases;
 **[LOW]** edge cases, hygiene, cosmetics.
 
-> Scope note: this document only identifies issues. Nothing is fixed.
+> Remediation status (Unreleased): the original HIGH items in the summary table
+> below are closed except remaining product-scope limits (unencrypted archives,
+> Debian/Ubuntu-only, no multi-node *migration*). Closed in this pass: §1.1/§1.2
+> (already), §1.3/§1.4 `url_decode`, §1.5 users comparison, §1.7 missing flag
+> values, §1.8 JSON escape, §2.1 interrupt restart, §2.2 pre-restore snapshot +
+> `--single-transaction`, §2.3 multi-node fail-closed, §2.4/§4.5 log flush +
+> mode 600, §2.5 `--service-timeout`, §2.6 free-space check, §4.2 openssl key
+> detect, §4.3 remote-dir quoting, §9.1 extra cert trees, §9.2 cert replace,
+> §10.1 WAL/SHM (already), §11.2 DSN parser, §11.5 backup `pg_test_connection`,
+> §13 local checksum (already). Still open by design or residual: §4.1
+> unencrypted archive, §4.4 TOFU SSH, §4.6 PGPASSWORD in environ, §5
+> portability (Debian/Ubuntu is the support matrix), §11.3 pg_dump version
+> coupling, multi-node *migration* (guard only).
 
 ---
 
@@ -459,6 +471,27 @@ connectivity error.
 ---
 
 ## 12. Restore issues
+
+### §12.1 — inbounds pinned to the source server's IP make the restore a silent no-op (HIGH) — FIXED
+
+3x-ui stores a per-inbound `listen` address. When the source panel pinned its
+inbounds to that server's own public IP, the literal travels with the database
+and is unbindable on the target, so xray-core exits with
+`bind: cannot assign requested address` and crash-loops. xray is a child of the
+panel process, so `systemctl is-active x-ui` stays `active`, every sanity row
+count matches, and restore.sh printed "Restore complete" while **not one
+inbound was serving traffic** — the worst class of failure this tool can have,
+and invisible without checking `ss`/journalctl by hand.
+
+Reproduced end-to-end on a live 3x-ui 3.6.0 SQLite migration (three enabled
+inbounds, all pinned to the source IP; all three dead after a "successful"
+restore).
+
+Fixed by `rebind_stale_inbound_listens` (detect + list + ask, with
+`--rebind-listen` / `--no-rebind-listen` / `--listen-address`) and
+`verify_xray_running` (post-start log check, exits 22 on a crash-looping core).
+Note this closes the second **[LOW]** item below only partially: the sanity
+check still runs after x-ui starts, but a crash-looping core is now caught.
 
 - **§1.2** — swallowed sanity failure → false success. (HIGH)
 - **§2.2** — destructive, non-transactional, no pre-restore snapshot. (HIGH)
